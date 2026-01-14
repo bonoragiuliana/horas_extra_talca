@@ -1,0 +1,7 @@
+Columnas detectadas:
+- DÃ­a
+- Fecha
+- Hora
+- DNI
+- Nombre
+- MarcaciÃ³n
