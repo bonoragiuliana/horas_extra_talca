@@ -7,14 +7,17 @@ import math
 import calendar
 from copy import copy
 from datetime import datetime, timedelta, date
+from pathlib import Path
 
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment
+from openpyxl.utils import get_column_letter
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from tkinter import ttk
+
+from openpyxl.formula.translate import Translator
 
 # =========================
 # OPTIONAL: feriados auto
@@ -43,12 +46,20 @@ DEFAULT_CONFIG = {
     "auto_holidays_enabled": True,
     "auto_holidays_country": "AR",
     "auto_holidays_subdiv": "M",  # Mendoza
-    "auto_holidays_observed": True
+    "auto_holidays_observed": True,
+    # debug opcional
+    "debug": False,
+    # modo merge si un empleado ya estaba:
+    # "sum" suma horas en la celda
+    # "replace" pisa horas en la celda
+    "merge_mode": "sum",
 }
 
 CONFIG_FILE = "config_horas_extra.json"
 EMP_MASTER_DEFAULT_NAME = "datos empleados.xlsx"
 TEMPLATE_DEFAULT_NAME = "formatosugerido.xlsx"
+
+TEMPLATE_SHEET_NAME = "_TEMPLATE"  # quedará OCULTA en el Excel final
 
 DOW_MAP = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
 
@@ -86,6 +97,23 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def debug_enabled(cfg: dict) -> bool:
+    return bool(cfg.get("debug", False))
+
+
+def debug_write_text(cfg: dict, filename: str, content: str) -> None:
+    if not debug_enabled(cfg):
+        return
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def debug_write_df(cfg: dict, filename: str, df: pd.DataFrame) -> None:
+    if not debug_enabled(cfg):
+        return
+    df.to_csv(filename, index=False, encoding="utf-8-sig")
 
 
 def clean_id(val) -> str:
@@ -189,6 +217,23 @@ def guess_col(columns_norm, keywords):
             if k in c:
                 return i
     return None
+
+
+def excel_cell_to_date(v):
+    """Convierte un valor de celda Excel (date/datetime/string) a date."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        dt = pd.to_datetime(str(v), errors="coerce", dayfirst=True)
+        if pd.isna(dt):
+            return None
+        return dt.date()
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -352,13 +397,6 @@ def read_veotime_to_daily(path: str, emp_master: pd.DataFrame, cfg: dict) -> pd.
         df.columns = [str(c).strip() for c in df.iloc[0].tolist()]
         df = df.iloc[1:].copy()
 
-    # debug
-    df.head(200).to_csv("debug_veotime_head.csv", index=False, encoding="utf-8-sig")
-    with open("debug_columnas.txt", "w", encoding="utf-8") as f:
-        f.write("Columnas detectadas:\n")
-        for c in df.columns:
-            f.write(f"- {c}\n")
-
     cols_norm = [normalize_text(c) for c in df.columns]
 
     i_fecha = guess_col(cols_norm, ["fecha"])
@@ -375,10 +413,12 @@ def read_veotime_to_daily(path: str, emp_master: pd.DataFrame, cfg: dict) -> pd.
     if i_nombre is None: missing.append("Nombre")
 
     if missing:
+        debug_write_df(cfg, "debug_veotime_head.csv", df.head(200))
+        debug_write_text(cfg, "debug_columnas.txt", "Columnas detectadas:\n" + "\n".join(f"- {c}" for c in df.columns))
         raise RuntimeError(
             "No pude detectar columnas clave en el reporte VeoTime.\n"
             f"Faltan: {', '.join(missing)}\n\n"
-            "Abrí debug_veotime_head.csv para ver encabezados."
+            "Tip: activá debug=true en config_horas_extra.json para guardar archivos de diagnóstico."
         )
 
     events = pd.DataFrame()
@@ -405,17 +445,16 @@ def read_veotime_to_daily(path: str, emp_master: pd.DataFrame, cfg: dict) -> pd.
     events = events[events["dni8"] != ""]
 
     if events.empty:
+        debug_write_df(cfg, "debug_veotime_head.csv", df.head(200))
         raise RuntimeError(
             "No quedaron eventos válidos (Entrada/Salida).\n"
-            "Revisá debug_veotime_head.csv, especialmente la columna Marcación."
+            "Tip: activá debug=true para generar debug_veotime_head.csv."
         )
 
-    # =======================
-    # FIX: evitar choque nombre_norm_rep
-    # =======================
+    # merge por dni8
     merged = events.merge(emp_master, how="left", on="dni8", suffixes=("_rep", "_master"))
 
-    # fallback por nombre para no matcheados
+    # fallback por nombre
     no_match = merged["nombre_master"].isna()
     if no_match.any():
         emp_by_name = emp_master.drop_duplicates(subset=["nombre_norm_rep"], keep="first").copy()
@@ -433,13 +472,11 @@ def read_veotime_to_daily(path: str, emp_master: pd.DataFrame, cfg: dict) -> pd.
                     "jornada_weekday", "rate_lav", "rate_sab", "rate_domfer"]:
             merged.loc[no_match, col] = merged_no[col].values
 
-        merged_no.to_csv("debug_matcheados_por_nombre.csv", index=False, encoding="utf-8-sig")
+        debug_write_df(cfg, "debug_matcheados_por_nombre.csv", merged_no)
 
     still_no = merged["nombre_master"].isna()
     if still_no.any():
-        merged.loc[still_no, ["dni8", "nombre_rep"]].drop_duplicates().to_csv(
-            "debug_no_matcheados.csv", index=False, encoding="utf-8-sig"
-        )
+        debug_write_df(cfg, "debug_no_matcheados.csv", merged.loc[still_no, ["dni8", "nombre_rep"]].drop_duplicates())
 
     # empresa / sector / nombre finales
     merged["empresa_final"] = merged["empresa_master"].fillna("").astype(str).str.strip()
@@ -499,7 +536,7 @@ def read_veotime_to_daily(path: str, emp_master: pd.DataFrame, cfg: dict) -> pd.
 
     daily = pd.DataFrame(daily_rows)
     if daily.empty:
-        raise RuntimeError("No pude construir horas diarias. Revisá debug_veotime_head.csv.")
+        raise RuntimeError("No pude construir horas diarias.")
     return daily
 
 
@@ -513,10 +550,9 @@ def compute_overtime_from_daily(daily: pd.DataFrame, cfg: dict) -> dict:
     d["dow_key"] = d["dow"].map(DOW_MAP)
 
     def std_hours(row):
-        # FERIADO: se calcula igual que un día normal (toma la jornada del empleado)
+        # FERIADO: se calcula igual que un día normal (toma jornada si holiday_standard_hours=0)
         if is_holiday(row["fecha"], cfg):
             hs = float(cfg.get("holiday_standard_hours", 0))
-            # compatibilidad: si en tu config quedó 0, usamos la jornada (ej: 8)
             if hs <= 0:
                 hs = float(row["jornada_weekday"])
             return hs
@@ -570,15 +606,8 @@ def _col_for_date(d: date, cfg: dict) -> int:
     return 6 + d.weekday()
 
 
-def _clear_data_area(ws, start_row=7, max_col=20):
-    for r in range(start_row, ws.max_row + 1):
-        for c in range(1, 13):
-            ws.cell(r, c).value = None
-        ws.cell(r, 19).value = None
-        ws.cell(r, 20).value = None
-
-
-def _ensure_rows(ws, start_row, n_rows_needed, base_style_row=7, max_col=20):
+def _ensure_rows(ws, start_row, n_rows_needed, base_style_row=7):
+    max_col = max(ws.max_column, 30)
     last_needed = start_row + n_rows_needed - 1
     if last_needed <= ws.max_row:
         return
@@ -588,6 +617,8 @@ def _ensure_rows(ws, start_row, n_rows_needed, base_style_row=7, max_col=20):
         for c in range(1, max_col + 1):
             src = ws.cell(base_style_row, c)
             dst = ws.cell(r, c)
+
+            # estilos
             dst._style = copy(src._style)
             dst.font = copy(src.font)
             dst.border = copy(src.border)
@@ -595,6 +626,17 @@ def _ensure_rows(ws, start_row, n_rows_needed, base_style_row=7, max_col=20):
             dst.number_format = src.number_format
             dst.protection = copy(src.protection)
             dst.alignment = copy(src.alignment)
+
+            # valores + fórmulas (si la celda base tiene fórmula, la traducimos a la nueva fila)
+            v = src.value
+            if isinstance(v, str) and v.startswith("="):
+                try:
+                    dst.value = Translator(v, origin=src.coordinate).translate_formula(dst.coordinate)
+                except Exception:
+                    dst.value = v
+            else:
+                dst.value = v
+
 
 
 def _set_week_header(ws, week_start: date, cfg: dict):
@@ -624,120 +666,328 @@ def _set_week_header(ws, week_start: date, cfg: dict):
     ws.cell(4, 12).number_format = "dd/mm/yy"
 
 
-# ============================================================
-# OUTPUT: 1 HOJA POR SEMANA (TODOS LOS EMPLEADOS)
-# ============================================================
-def build_output_workbook_template(weeks: dict, out_path: str, template_path: str, cfg: dict):
-    wb = load_workbook(template_path)
-    tpl = wb.active
-    created = []
+def _clear_data_area(ws, start_row=7):
+    """
+    Limpia SOLO lo que es "dato de empleado" y horas (A..L) + tarifas (M..O),
+    pero NO borra las columnas de cálculos (fórmulas) que están más a la derecha.
+    """
+    for r in range(start_row, ws.max_row + 1):
+        # A..D (empresa, sector, legajo, nombre)
+        for c in range(1, 5):
+            ws.cell(r, c).value = None
 
-    for week_start, df_week in sorted(weeks.items(), key=lambda x: x[0]):
+        # E..L (horas por día)
+        for c in range(5, 13):
+            ws.cell(r, c).value = 0
+            ws.cell(r, c).number_format = "0"
+            ws.cell(r, c).alignment = Alignment(horizontal="center", vertical="center")
+
+        # M..O (tarifas $/h LaV, Sab, Dom/Fer) -> las dejamos en 0 hasta cargar
+        for c in range(13, 16):
+            ws.cell(r, c).value = 0
+            ws.cell(r, c).number_format = "#,##0"
+            ws.cell(r, c).alignment = Alignment(horizontal="center", vertical="center")
+
+
+
+# ============================================================
+# TEMPLATE: asegurar _TEMPLATE oculta dentro del workbook de salida
+# (para poder copiar hojas dentro del MISMO archivo)
+# ============================================================
+def clone_template_sheet_into_workbook(wb_dest, template_path: str) -> None:
+    """
+    Crea una hoja _TEMPLATE en wb_dest copiando celdas/estilos desde template_path.
+    (sirve cuando el Excel existente NO tenía _TEMPLATE).
+    """
+    src_wb = load_workbook(template_path)
+    src = src_wb.active
+
+    if TEMPLATE_SHEET_NAME in wb_dest.sheetnames:
+        return
+
+    dst = wb_dest.create_sheet(TEMPLATE_SHEET_NAME)
+
+    # tamaños de columnas
+    for col_letter, dim in src.column_dimensions.items():
+        dst.column_dimensions[col_letter].width = dim.width
+
+    # alturas de filas
+    for row_idx, dim in src.row_dimensions.items():
+        dst.row_dimensions[row_idx].height = dim.height
+
+    # celdas + estilos
+    for row in src.iter_rows():
+        for cell in row:
+            new_cell = dst.cell(row=cell.row, column=cell.column, value=cell.value)
+            if cell.has_style:
+                new_cell._style = copy(cell._style)
+                new_cell.font = copy(cell.font)
+                new_cell.border = copy(cell.border)
+                new_cell.fill = copy(cell.fill)
+                new_cell.number_format = cell.number_format
+                new_cell.protection = copy(cell.protection)
+                new_cell.alignment = copy(cell.alignment)
+
+    # merges
+    for m in src.merged_cells.ranges:
+        dst.merge_cells(str(m))
+
+    # propiedades de hoja (básicas)
+    dst.sheet_view.showGridLines = src.sheet_view.showGridLines
+    dst.page_setup = copy(src.page_setup)
+    dst.page_margins = copy(src.page_margins)
+
+    src_wb.close()
+
+
+def ensure_hidden_template(wb, template_path: str):
+    """
+    Garantiza que exista una hoja _TEMPLATE y quede veryHidden (no visible en Excel).
+    Devuelve el worksheet template.
+    """
+    # si existe template con otro nombre "TEMPLATE", lo renombramos
+    if TEMPLATE_SHEET_NAME not in wb.sheetnames:
+        if "TEMPLATE" in wb.sheetnames:
+            ws = wb["TEMPLATE"]
+            ws.title = TEMPLATE_SHEET_NAME
+
+    if TEMPLATE_SHEET_NAME not in wb.sheetnames:
+        # inyectar desde archivo template
+        clone_template_sheet_into_workbook(wb, template_path)
+
+    tpl = wb[TEMPLATE_SHEET_NAME]
+    # ocultar fuerte
+    tpl.sheet_state = "veryHidden"
+    return tpl
+
+
+def find_week_sheet(wb, week_start: date):
+    """
+    Busca la hoja de una semana:
+    1) por nombre exacto "Semana dd-mm"
+    2) por header (celda F4 = lunes)
+    """
+    target_title = _safe_sheet_title(f"Semana {week_start.strftime('%d-%m')}")
+    if target_title in wb.sheetnames:
+        return wb[target_title]
+
+    for name in wb.sheetnames:
+        if name == TEMPLATE_SHEET_NAME:
+            continue
+        ws = wb[name]
+        v = ws.cell(4, 6).value  # F4 = lunes
+        d = excel_cell_to_date(v)
+        if d == week_start:
+            return ws
+    return None
+
+
+def get_or_create_week_sheet(wb, tpl, week_start: date, cfg: dict):
+    ws = find_week_sheet(wb, week_start)
+    created_new = False
+
+    if ws is None:
         ws = wb.copy_worksheet(tpl)
-        created.append(ws)
-
+        ws.sheet_state = "visible"
         ws.title = _safe_sheet_title(f"Semana {week_start.strftime('%d-%m')}")
         _set_week_header(ws, week_start, cfg)
+        _clear_data_area(ws, start_row=7)
+        created_new = True
+    else:
+        # Si ya existía, NO borramos nada. Solo aseguramos header coherente
+        _set_week_header(ws, week_start, cfg)
 
-        ws["M6"].value = ""
-        ws["N6"].value = ""
-        ws["O6"].value = ""
+    return ws, created_new
 
-        _clear_data_area(ws, start_row=7, max_col=20)
 
-        sub = df_week.copy()
+def read_existing_employee_rows(ws, start_row=7):
+    """
+    Devuelve:
+    - dict dni->row
+    - next_insert_row (primera fila libre debajo del último empleado)
+    """
+    row_by_dni = {}
+    last_filled = start_row - 1
 
-        day_he = (
-            sub.groupby(["empresa", "dni", "nombre", "sector", "fecha", "rate_lav", "rate_sab", "rate_domfer"], dropna=False)["horas_extra"]
-            .sum()
-            .reset_index()
-        )
+    empty_run = 0
+    # ojo: algunos templates tienen max_row enorme, cortamos por "muchas filas vacías seguidas"
+    for r in range(start_row, ws.max_row + 1):
+        a = ws.cell(r, 1).value
+        b = ws.cell(r, 2).value
+        c = ws.cell(r, 3).value
+        d = ws.cell(r, 4).value
 
-        employees = (
-            day_he[["empresa", "dni", "nombre", "sector", "rate_lav", "rate_sab", "rate_domfer"]]
-            .drop_duplicates()
-            .sort_values(["empresa", "sector", "nombre"])
-        )
+        has_data = any(v not in (None, "") for v in [a, b, c, d])
 
-        _ensure_rows(ws, start_row=7, n_rows_needed=len(employees), base_style_row=7, max_col=20)
+        if has_data:
+            empty_run = 0
+            last_filled = r
+            dni = str(c).strip() if c not in (None, "") else ""
+            if dni:
+                row_by_dni[dni] = r
+        else:
+            empty_run += 1
+            if empty_run >= 30 and r > start_row + 30:
+                break
 
-        he_map = {}
-        for _, r in day_he.iterrows():
-            key = (str(r["empresa"]), str(r["dni"]), str(r["nombre"]), str(r["sector"]))
-            he_map.setdefault(key, {})[r["fecha"]] = float(r["horas_extra"])
+    return row_by_dni, (last_filled + 1)
 
-        for i, (_, emp) in enumerate(employees.iterrows()):
-            row = 7 + i
-            empresa = str(emp["empresa"])
-            dni = str(emp["dni"])
-            nombre = str(emp["nombre"])
-            sector = str(emp["sector"])
 
-            rate_lav = float(emp["rate_lav"])
-            rate_sab = float(emp["rate_sab"])
-            rate_domfer = float(emp["rate_domfer"])
+def num_or_zero(v):
+    try:
+        if v is None or v == "":
+            return 0.0
+        return float(v)
+    except Exception:
+        return 0.0
 
-            ws.cell(row, 1).value = empresa
-            ws.cell(row, 2).value = sector
-            ws.cell(row, 3).value = dni
-            ws.cell(row, 4).value = nombre
+def _ensure_row_formulas_from_base(ws, target_row, base_row=7, max_col=30):
+    """
+    Si en la fila base hay fórmulas, las copia/ajusta a la fila target.
+    Sirve para arreglar archivos que quedaron sin fórmulas en filas nuevas.
+    """
+    for c in range(1, max_col + 1):
+        src = ws.cell(base_row, c)
+        v = src.value
+        if isinstance(v, str) and v.startswith("="):
+            dst = ws.cell(target_row, c)
+            # si no hay fórmula, la ponemos (o si hay número porque antes la pisamos)
+            if not (isinstance(dst.value, str) and dst.value.startswith("=")):
+                try:
+                    dst.value = Translator(v, origin=src.coordinate).translate_formula(dst.coordinate)
+                except Exception:
+                    dst.value = v
 
-            # inicializar E..L en 0
+
+def upsert_week_employees(ws, df_week: pd.DataFrame, cfg: dict):
+    if df_week is None or df_week.empty:
+        return
+
+    sub = df_week.copy()
+
+    day_he = (
+        sub.groupby(["empresa", "dni", "nombre", "sector", "fecha", "rate_lav", "rate_sab", "rate_domfer"], dropna=False)["horas_extra"]
+        .sum()
+        .reset_index()
+    )
+
+    employees = (
+        day_he[["empresa", "dni", "nombre", "sector", "rate_lav", "rate_sab", "rate_domfer"]]
+        .drop_duplicates()
+        .sort_values(["empresa", "sector", "nombre"])
+    )
+
+    # mapa horas extra por dni y fecha
+    he_map = {}
+    for _, r in day_he.iterrows():
+        dni = str(r["dni"]).strip()
+        he_map.setdefault(dni, {})[r["fecha"]] = int(float(r["horas_extra"]))
+
+    row_by_dni, next_row = read_existing_employee_rows(ws, start_row=7)
+
+    _ensure_rows(ws, start_row=7, n_rows_needed=max(10, next_row - 6 + len(employees)), base_style_row=7)
+
+    merge_mode = str(cfg.get("merge_mode", "sum")).strip().lower()
+
+    for _, emp in employees.iterrows():
+        empresa = str(emp["empresa"])
+        dni = str(emp["dni"]).strip()
+        nombre = str(emp["nombre"])
+        sector = str(emp["sector"])
+
+        rate_lav = float(emp["rate_lav"])
+        rate_sab = float(emp["rate_sab"])
+        rate_domfer = float(emp["rate_domfer"])
+
+        if not dni:
+            continue
+
+        if dni in row_by_dni:
+            row = row_by_dni[dni]
+            is_new = False
+        else:
+            row = next_row
+            next_row += 1
+            row_by_dni[dni] = row
+            is_new = True
+
+        # A..D
+        ws.cell(row, 1).value = empresa
+        ws.cell(row, 2).value = sector
+        ws.cell(row, 3).value = dni
+        ws.cell(row, 4).value = nombre
+
+        # Tarifas M..O (13..15)
+        ws.cell(row, 13).value = round(rate_lav, 0)
+        ws.cell(row, 14).value = round(rate_sab, 0)
+        ws.cell(row, 15).value = round(rate_domfer, 0)
+        for c in (13, 14, 15):
+            ws.cell(row, c).number_format = "#,##0"
+            ws.cell(row, c).alignment = Alignment(horizontal="center", vertical="center")
+
+        # Si es fila nueva, inicializamos horas E..L en 0 (por si no viene algo del template)
+        if is_new:
             for c in range(5, 13):
                 ws.cell(row, c).value = 0
                 ws.cell(row, c).number_format = "0"
                 ws.cell(row, c).alignment = Alignment(horizontal="center", vertical="center")
 
-            key = (empresa, dni, nombre, sector)
-            emp_he_by_date = he_map.get(key, {})
+        # Horas extra por fecha (E..L)
+        emp_he_by_date = he_map.get(dni, {})
+        for dte, he in emp_he_by_date.items():
+            if he <= 0:
+                continue
+            col = _col_for_date(dte, cfg)
+            cur = ws.cell(row, col).value
 
-            for dte, he in emp_he_by_date.items():
-                col = _col_for_date(dte, cfg)
-                ws.cell(row, col).value = int(he)
-                ws.cell(row, col).number_format = "0"
+            if merge_mode == "replace":
+                new_val = he
+            else:
+                new_val = int(num_or_zero(cur)) + int(he)
 
-            # costos por empleado
-            cost_lav = 0.0
-            cost_sab = 0.0
-            cost_domfer = 0.0
+            ws.cell(row, col).value = new_val
+            ws.cell(row, col).number_format = "0"
+            ws.cell(row, col).alignment = Alignment(horizontal="center", vertical="center")
 
-            for dte, he in emp_he_by_date.items():
-                he = float(he)
-                if he <= 0:
-                    continue
-                if is_holiday(dte, cfg) or dte.weekday() == 6:
-                    cost_domfer += he * rate_domfer
-                elif dte.weekday() == 5:
-                    cost_sab += he * rate_sab
-                else:
-                    cost_lav += he * rate_lav
+        # Asegurar fórmulas en la fila (por si antes quedaron pisadas o vacías)
+        _ensure_row_formulas_from_base(ws, target_row=row, base_row=7, max_col=max(ws.max_column, 30))
 
-            subtotal = cost_lav + cost_sab + cost_domfer
 
-            ws.cell(row, 13).value = round(cost_lav, 0)
-            ws.cell(row, 14).value = round(cost_sab, 0)
-            ws.cell(row, 15).value = round(cost_domfer, 0)
-            ws.cell(row, 16).value = round(subtotal, 0)
-            ws.cell(row, 17).value = 0
-            ws.cell(row, 18).value = round(subtotal, 0)
 
-            for c in [13, 14, 15, 16, 17, 18]:
-                ws.cell(row, c).number_format = "#,##0"
-                ws.cell(row, c).alignment = Alignment(horizontal="center", vertical="center")
+def update_or_build_output_workbook(weeks: dict, out_path: str, template_path: str, cfg: dict):
+    """
+    - Si out_path existe: actualiza (append empleados).
+    - Si no existe: crea nuevo desde template (pero _TEMPLATE queda oculta).
+    """
+    if os.path.exists(out_path):
+        wb = load_workbook(out_path)
+        tpl = ensure_hidden_template(wb, template_path)
+    else:
+        wb = load_workbook(template_path)
+        # renombrar/asegurar template dentro del nuevo workbook
+        tpl0 = wb.active
+        tpl0.title = TEMPLATE_SHEET_NAME
+        tpl = ensure_hidden_template(wb, template_path)
 
-            ws.cell(row, 19).value = None
-            ws.cell(row, 20).value = None
+    created_any = False
 
-    wb.remove(tpl)
+    for week_start, df_week in sorted(weeks.items(), key=lambda x: x[0]):
+        ws, created_new = get_or_create_week_sheet(wb, tpl, week_start, cfg)
+        created_any = created_any or created_new
+        upsert_week_employees(ws, df_week, cfg)
 
-    if not created:
-        raise RuntimeError("No se generaron hojas. Revisá si el reporte trae datos válidos.")
+    # asegurar template oculto siempre
+    if TEMPLATE_SHEET_NAME in wb.sheetnames:
+        wb[TEMPLATE_SHEET_NAME].sheet_state = "veryHidden"
+
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
 
     wb.save(out_path)
 
 
 # ============================================================
-# UI PREMIUM + CALENDARIO INLINE
+# UI + CALENDARIO INLINE
 # ============================================================
 def run_app():
     cfg = load_config()
@@ -776,7 +1026,6 @@ def run_app():
     selected_holidays_manual = set()
     selected_holidays_auto = set()
 
-    # IMPORTANT: Fix NameError btn_generate (se crea después)
     btn_generate = None
 
     def set_status(msg: str):
@@ -850,7 +1099,6 @@ def run_app():
         except Exception:
             pass
 
-    # ===== Summary / state =====
     def update_generate_state():
         rp = var_report.get().strip()
         emp = var_emp.get().strip()
@@ -862,7 +1110,6 @@ def run_app():
             tpl and os.path.exists(tpl)
         )
 
-        # Fix: si todavía no existe el botón, no hacemos nada
         if btn_generate is None:
             return
 
@@ -883,7 +1130,7 @@ def run_app():
 
         update_generate_state()
 
-    # ====== default files local ======
+    # defaults locales
     local_emp = os.path.join(os.getcwd(), EMP_MASTER_DEFAULT_NAME)
     if not var_emp.get().strip() and os.path.exists(local_emp):
         var_emp.set(local_emp)
@@ -908,8 +1155,26 @@ def run_app():
 
     right_h = tb.Frame(header)
     right_h.pack(side="right")
-    tb.Label(right_h, text="RRHH", bootstyle="info-inverse", padding=(10, 4)).pack(side="right", padx=(8, 0))
-    tb.Label(right_h, text="TALCA", bootstyle="secondary-inverse", padding=(10, 4)).pack(side="right")
+
+    LOGO_PATH = Path(__file__).resolve().parent / "assets" / "talca_logo.png"
+    logo_img = None
+    try:
+        from PIL import Image, ImageTk
+        img = Image.open(LOGO_PATH)
+        img = img.resize((160, 46), Image.LANCZOS)
+        logo_img = ImageTk.PhotoImage(img)
+    except Exception:
+        try:
+            logo_img = tk.PhotoImage(file=str(LOGO_PATH))
+        except Exception:
+            logo_img = None
+
+    if logo_img:
+        lbl_logo = tb.Label(right_h, image=logo_img)
+        lbl_logo.pack(side="right")
+        lbl_logo.image = logo_img
+    else:
+        tb.Label(right_h, text="TALCA", bootstyle="secondary-inverse", padding=(10, 4)).pack(side="right")
 
     body = tb.Frame(root, padding=(20, 0, 20, 12))
     body.pack(fill="both", expand=True)
@@ -928,13 +1193,10 @@ def run_app():
 
     tab_files = tb.Frame(nb, padding=16)
     tab_holidays = tb.Frame(nb, padding=16)
-    tab_help = tb.Frame(nb, padding=16)
 
     nb.add(tab_files, text="  1 · Archivos  ")
     nb.add(tab_holidays, text="  2 · Feriados  ")
-    nb.add(tab_help, text="  3 · Checklist  ")
 
-    # Right: summary + status
     summary = tb.Labelframe(right, text="RESUMEN", padding=16, bootstyle="secondary")
     summary.pack(fill="x")
 
@@ -987,7 +1249,6 @@ def run_app():
             set_status("Reporte seleccionado. Paso 2: revisá feriados (si aplica).")
             refresh_auto_holidays()
             update_summary()
-            # refrescar calendario si estaba armado
             try:
                 render_calendar()
                 render_holiday_list()
@@ -1019,14 +1280,6 @@ def run_app():
     entry_file(tab_files, "Reporte VeoTime (.xls/.xlsx)", var_report, pick_report, hint="Obligatorio")
     entry_file(tab_files, "Datos empleados.xlsx", var_emp, pick_emp, hint="Obligatorio")
     entry_file(tab_files, "Plantilla formatosugerido.xlsx", var_tpl, pick_tpl, hint="Obligatorio")
-
-    tip_box = tb.Labelframe(tab_files, text="Tip", padding=12, bootstyle="info")
-    tip_box.pack(fill="x", pady=(10, 0))
-    tb.Label(
-        tip_box,
-        text="Si algo no matchea, se generan archivos debug (debug_veotime_head.csv / debug_no_matcheados.csv).",
-        wraplength=760, justify="left"
-    ).pack(anchor="w")
 
     # ==========================================================
     # TAB 2: HOLIDAYS (INLINE CALENDAR)
@@ -1170,9 +1423,9 @@ def run_app():
             range_lbl.config(text="(Tip: al elegir el reporte, se limita el rango del calendario)")
 
         enabled = var_use_holidays.get()
-        weeks = calendar.monthcalendar(y, m)
+        weeks_ = calendar.monthcalendar(y, m)
 
-        for week in weeks:
+        for week in weeks_:
             row = tb.Frame(cells)
             row.pack(fill="x", pady=2)
 
@@ -1292,30 +1545,12 @@ def run_app():
         render_calendar()
 
     # ==========================================================
-    # TAB 3: CHECKLIST
-    # ==========================================================
-    tb.Label(tab_help, text="Checklist rápido", font=FONT_H2).pack(anchor="w", pady=(0, 10))
-
-    tips = [
-        "• El reporte debe contener: Fecha / Hora / Marcación / DNI / Nombre.",
-        "• Feriados se liquidan con tarifa DomYFer del empleado.",
-        "• Horas extra se calculan en horas ENTERAS (sin minutos).",
-        "• Si alguien no matchea: debug_no_matcheados.csv",
-        "• Si matchea por nombre: debug_matcheados_por_nombre.csv",
-    ]
-    box = tb.Labelframe(tab_help, text="Notas", padding=14, bootstyle="light")
-    box.pack(fill="both", expand=True)
-
-    for t in tips:
-        tb.Label(box, text=t, foreground="#444", wraplength=820, justify="left").pack(anchor="w", pady=6)
-
-    # ==========================================================
-    # FOOTER: GENERATE ALWAYS VISIBLE
+    # FOOTER: GENERATE
     # ==========================================================
     footer = tb.Frame(root, padding=(20, 12))
     footer.pack(fill="x")
 
-    tb.Label(footer, text="Cuando esté todo listo, generá el Excel con un clic.", foreground="#666").pack(side="left")
+    tb.Label(footer, text="Podés guardar un archivo nuevo o elegir uno existente para agregar empleados.", foreground="#666").pack(side="left")
 
     def generate():
         rp = var_report.get().strip()
@@ -1324,16 +1559,19 @@ def run_app():
 
         default_out = os.path.join(
             os.path.dirname(rp) if rp else os.getcwd(),
-            f"Liquidacion_Horas_Extra_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+            "Liquidacion_Horas_Extra.xlsx"
         )
+
         out_path = filedialog.asksaveasfilename(
-            title="Guardar liquidación como",
+            title="Guardar / Actualizar liquidación",
             defaultextension=".xlsx",
             initialfile=os.path.basename(default_out),
             filetypes=[("Excel", "*.xlsx")]
         )
         if not out_path:
             return
+
+        existed = os.path.exists(out_path)
 
         btn_generate.configure(state="disabled")
         pb.start(12)
@@ -1354,21 +1592,27 @@ def run_app():
             emp_master = load_employee_master(emp)
             daily = read_veotime_to_daily(rp, emp_master, cfg)
             weeks = compute_overtime_from_daily(daily, cfg)
-            build_output_workbook_template(weeks, out_path, tpl, cfg)
 
-            set_status("Listo ✅ Excel generado correctamente.")
+            set_status("Escribiendo Excel… (si ya existe, agrega empleados abajo)")
+            update_or_build_output_workbook(weeks, out_path, tpl, cfg)
+
+            set_status("Listo ✅ Excel generado/actualizado correctamente.")
             messagebox.showinfo(
                 "Listo ✅",
-                f"Se generó el Excel:\n{out_path}\n\n"
-                "Debug (si algo no matchea):\n"
-                "• debug_veotime_head.csv\n"
-                "• debug_no_matcheados.csv\n"
-                "• debug_matcheados_por_nombre.csv"
+                ("Se ACTUALIZÓ el Excel (se agregaron empleados debajo de los existentes):\n"
+                 if existed else "Se generó el Excel:\n") + f"{out_path}"
+            )
+
+        except PermissionError:
+            set_status("Error ❌ El archivo está abierto.")
+            messagebox.showerror(
+                "Archivo en uso",
+                "Cerrá el Excel (está abierto) y volvé a intentar.\n"
+                "Windows no deja guardar si el archivo está en uso."
             )
 
         except Exception as e:
             tbtxt = traceback.format_exc()
-            print(tbtxt)
             with open("debug_error.txt", "w", encoding="utf-8") as f:
                 f.write(tbtxt)
             set_status("Error ❌ Revisá debug_error.txt")
@@ -1378,7 +1622,7 @@ def run_app():
             pb.stop()
             update_generate_state()
 
-    btn_generate = tb.Button(footer, text="Generar liquidación", command=generate, bootstyle="success", width=22)
+    btn_generate = tb.Button(footer, text="Generar / Actualizar", command=generate, bootstyle="success", width=22)
     btn_generate.pack(side="right")
 
     # ==========================================================
@@ -1391,7 +1635,6 @@ def run_app():
     var_emp.trace_add("write", on_any_change)
     var_tpl.trace_add("write", on_any_change)
 
-    # init
     refresh_auto_holidays()
     render_holiday_list()
     render_calendar()
