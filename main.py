@@ -12,7 +12,6 @@ from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment
-from openpyxl.utils import get_column_letter
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -38,10 +37,6 @@ DEFAULT_CONFIG = {
     "template_excel_path": "",
     # feriados (se guardan como YYYY-MM-DD)
     "holidays": [],
-    # estándar por día
-    "saturday_standard_hours": 8,
-    "sunday_standard_hours": 0,
-    "holiday_standard_hours": 0,
     # auto feriados
     "auto_holidays_enabled": True,
     "auto_holidays_country": "AR",
@@ -53,6 +48,14 @@ DEFAULT_CONFIG = {
     # "sum" suma horas en la celda
     # "replace" pisa horas en la celda
     "merge_mode": "sum",
+
+    # --- IMPORTANTE ---
+    # Dejo estos por compatibilidad (ya no los usamos para calcular extra, porque ahora:
+    # - Lun-Vie: extra = horas_trab - jornada
+    # - Sab/Dom/Feriado: todo lo trabajado cuenta como extra
+    "saturday_standard_hours": 0,
+    "sunday_standard_hours": 0,
+    "holiday_standard_hours": 0,
 }
 
 CONFIG_FILE = "config_horas_extra.json"
@@ -75,8 +78,24 @@ def normalize_text(s) -> str:
         c for c in unicodedata.normalize("NFKD", s)
         if not unicodedata.combining(c)
     )
+    # saca comas, puntos, guiones, etc. (deja letras/numeros/espacios)
+    s = re.sub(r"[^a-z0-9\s]+", " ", s)
     s = " ".join(s.split())
     return s
+
+
+def name_keys(raw: str):
+    """
+    Devuelve 3 claves para matchear nombres aunque vengan con extras:
+    - full: nombre normalizado completo
+    - first2: primeras 2 palabras
+    - last2: últimas 2 palabras
+    """
+    full = normalize_text(raw)
+    toks = full.split()
+    first2 = " ".join(toks[:2]) if len(toks) >= 2 else full
+    last2 = " ".join(toks[-2:]) if len(toks) >= 2 else full
+    return full, first2, last2
 
 
 def load_config() -> dict:
@@ -87,7 +106,6 @@ def load_config() -> dict:
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
-    # merge defaults
     for k, v in DEFAULT_CONFIG.items():
         if k not in cfg:
             cfg[k] = v
@@ -133,13 +151,43 @@ def only_digits(s: str) -> str:
     return re.sub(r"\D", "", str(s or ""))
 
 
-def split_cuil_to_dni(id_value: str):
-    digits = only_digits(id_value)
+def id_key_from_any(val) -> str:
+    """
+    Clave interna estable para matchear:
+    - deja solo dígitos
+    - quita ceros a la izquierda (00123 == 123)
+    """
+    digits = only_digits(clean_id(val))
+    if not digits:
+        return ""
+    k = digits.lstrip("0")
+    return k if k else "0"
+
+
+def extract_id_parts(val):
+    """
+    Devuelve:
+      - key: clave estable (sin ceros a la izquierda)
+      - digits: dígitos completos
+      - cuil11: si parece CUIL (11)
+      - dni8: si se puede inferir DNI (8) (desde DNI o desde CUIL)
+    """
+    digits = only_digits(clean_id(val))
+    key = id_key_from_any(val)
+
+    cuil11 = digits if len(digits) == 11 else ""
+
+    dni8 = ""
     if len(digits) == 11:
-        return digits[2:10], digits
-    if len(digits) >= 8:
-        return digits[-8:], digits if len(digits) == 11 else ""
-    return "", ""
+        dni8 = digits[2:10].zfill(8)
+    elif len(digits) == 8:
+        dni8 = digits
+    elif len(digits) == 7:
+        dni8 = digits.zfill(8)
+    elif len(digits) > 8:
+        dni8 = digits[-8:]
+
+    return key, digits, cuil11, dni8
 
 
 def parse_date(val):
@@ -188,6 +236,42 @@ def parse_time_only(val):
         return None
     return dt.time()
 
+def round_dt_to_nearest_hour(dt: datetime) -> datetime:
+    """
+    Redondea al entero de hora más cercano:
+    - 20:58 -> 21:00
+    - 06:01 -> 06:00
+    - 06:05 -> 06:00
+    - 18:10 -> 18:00
+    Regla: suma 30 min y luego trunca a la hora.
+    """
+    return (dt + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
+
+
+
+def floor_time_to_hour(t):
+    """Trunca minutos/segundos: 06:05 -> 06:00"""
+    if t is None:
+        return None
+    return t.replace(minute=0, second=0, microsecond=0)
+
+def split_interval_by_date(start_dt: datetime, end_dt: datetime):
+    """
+    Parte un intervalo en horas por cada fecha calendario.
+    Devuelve dict: {date: horas_int}
+    """
+    out = {}
+    cur = start_dt
+    while cur.date() < end_dt.date():
+        midnight = datetime.combine(cur.date() + timedelta(days=1), datetime.min.time())
+        hs = int((midnight - cur).total_seconds() // 3600)
+        out[cur.date()] = out.get(cur.date(), 0) + hs
+        cur = midnight
+
+    hs_last = int((end_dt - cur).total_seconds() // 3600)
+    out[end_dt.date()] = out.get(end_dt.date(), 0) + hs_last
+    return out
+
 
 def monday_of_week(d: date) -> date:
     return d - timedelta(days=d.weekday())
@@ -220,7 +304,6 @@ def guess_col(columns_norm, keywords):
 
 
 def excel_cell_to_date(v):
-    """Convierte un valor de celda Excel (date/datetime/string) a date."""
     if v is None:
         return None
     if isinstance(v, datetime):
@@ -236,17 +319,78 @@ def excel_cell_to_date(v):
         return None
 
 
+def round_hours(x: float, step: float = 0.25) -> float:
+    """
+    Redondeo de horas a "pasos" (por defecto 15 min = 0.25h).
+    Esto evita cosas tipo 0.49999997 por floats.
+    """
+    try:
+        x = float(x)
+    except Exception:
+        return 0.0
+    if x <= 0:
+        return 0.0
+    # redondeo al step más cercano (sin banker's rounding)
+    return round(math.floor(x / step + 0.5) * step, 2)
+
+
+
+def num_or_zero(v):
+    try:
+        if v is None or v == "":
+            return 0.0
+        return float(v)
+    except Exception:
+        return 0.0
+
+def force_integer_hours_format(ws, row, col_start=5, col_end=12):
+    """
+    Fuerza que las celdas de horas (Dom..Feriado = columnas 5..12)
+    se vean como enteros (sin ,00).
+    """
+    for c in range(col_start, col_end + 1):
+        cell = ws.cell(row, c)
+
+        # convierte el valor a int si hay algo
+        try:
+            if cell.value not in (None, ""):
+                cell.value = int(float(cell.value))
+        except Exception:
+            pass
+
+        # formato de número sin decimales
+        cell.number_format = "0"
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+
+def compute_amounts_for_row(ws, row, rate_lav, rate_sab, rate_domfer):
+    # Columnas horas (según tu plantilla):
+    # Dom=5, Lun=6, Mar=7, Mier=8, Jue=9, Vie=10, Sab=11, Feriado=12
+    hours_dom = num_or_zero(ws.cell(row, 5).value)
+    hours_lun = num_or_zero(ws.cell(row, 6).value)
+    hours_mar = num_or_zero(ws.cell(row, 7).value)
+    hours_mie = num_or_zero(ws.cell(row, 8).value)
+    hours_jue = num_or_zero(ws.cell(row, 9).value)
+    hours_vie = num_or_zero(ws.cell(row, 10).value)
+    hours_sab = num_or_zero(ws.cell(row, 11).value)
+    hours_fer = num_or_zero(ws.cell(row, 12).value)
+
+    hours_weekday = hours_lun + hours_mar + hours_mie + hours_jue + hours_vie
+    hours_domfer = hours_dom + hours_fer
+
+    amt_weekday = int(round(hours_weekday * float(rate_lav), 0))
+    amt_sat = int(round(hours_sab * float(rate_sab), 0))
+    amt_domfer = int(round(hours_domfer * float(rate_domfer), 0))
+
+    return amt_weekday, amt_sat, amt_domfer
+
+
 # ============================================================
 # AUTO HOLIDAYS (Argentina - Mendoza)
 # ============================================================
 def compute_auto_holidays_for_range(start: date, end: date, cfg: dict):
-    """
-    Devuelve feriados (nacionales + Mendoza) dentro del rango [start, end].
-    Requiere paquete `holidays`.
-    """
     if pyholidays is None:
         return []
-
     if start is None or end is None:
         return []
 
@@ -266,7 +410,6 @@ def compute_auto_holidays_for_range(start: date, end: date, cfg: dict):
         if cur in hcal:
             out.append(cur)
         cur += timedelta(days=1)
-
     return out
 
 
@@ -287,7 +430,7 @@ def load_employee_master(emp_path: str) -> pd.DataFrame:
 
     c_empresa = col_like(["empresa"])
     c_sector = col_like(["sector"])
-    c_id = col_like(["id"])
+    c_id = col_like(["id"])  # en tu master se llama ID
     c_name = col_like(["apellido", "nombre"])
     c_jornada = col_like(["jornada"])
     c_lav = col_like(["lav"])
@@ -298,24 +441,34 @@ def load_employee_master(emp_path: str) -> pd.DataFrame:
     if any(x is None for x in need):
         raise RuntimeError(
             "En datos empleados.xlsx faltan columnas esperadas.\n"
-            "Necesito: EMPRESA, SECTOR, ID (CUIL/DNI), APELLIDO Y NOMBRE, JORNADA, $/hs LaV, $/hs Sab, $/hs DomYFer."
+            "Necesito: EMPRESA, SECTOR, ID, APELLIDO Y NOMBRE, JORNADA, $/hs LaV, $/hs Sab, $/hs DomYFer."
         )
 
     out = pd.DataFrame()
-    out["raw_id"] = df[c_id].apply(clean_id)
-    out["dni8"] = out["raw_id"].apply(lambda x: split_cuil_to_dni(x)[0])
+    out["id_master_display"] = df[c_id].apply(clean_id).astype(str).str.strip()
+
+    parts = out["id_master_display"].apply(lambda x: pd.Series(
+        extract_id_parts(x),
+        index=["id_key", "id_digits", "id_cuil11", "id_dni8"]
+    ))
+    out = pd.concat([out, parts], axis=1)
 
     out["empresa_master"] = df[c_empresa].fillna("").astype(str).str.strip()
     out["sector_master"] = df[c_sector].fillna("").astype(str).str.strip().apply(normalize_text)
+
     out["nombre_master"] = df[c_name].fillna("").astype(str).str.strip()
-    out["nombre_norm_rep"] = out["nombre_master"].apply(normalize_text)
+    nk = out["nombre_master"].apply(lambda s: pd.Series(name_keys(s), index=["nombre_norm", "nombre_first2", "nombre_last2"]))
+    out = pd.concat([out, nk], axis=1)
 
     out["jornada_weekday"] = pd.to_numeric(df[c_jornada], errors="coerce").fillna(0).astype(float)
     out["rate_lav"] = pd.to_numeric(df[c_lav], errors="coerce").fillna(0).astype(float)
     out["rate_sab"] = pd.to_numeric(df[c_sab], errors="coerce").fillna(0).astype(float)
     out["rate_domfer"] = pd.to_numeric(df[c_domfer], errors="coerce").fillna(0).astype(float)
 
-    out = out[out["dni8"] != ""].drop_duplicates(subset=["dni8"], keep="first")
+    out = out[out["id_key"] != ""].copy()
+    out = out.reset_index(drop=True)
+    out["midx"] = out.index  # id interno estable
+
     return out
 
 
@@ -370,10 +523,10 @@ def find_header_row(df_raw, max_rows=80):
 
         has_fecha = "fecha" in text
         has_hora = "hora" in text or "time" in text
-        has_dni = "dni" in text or "documento" in text or "legajo" in text
+        has_id = ("dni" in text) or ("documento" in text) or ("legajo" in text) or ("id" in text)
         has_marc = "marc" in text or "tipo" in text
 
-        if has_fecha and has_hora and has_dni and has_marc:
+        if has_fecha and has_hora and has_id and has_marc:
             return r
     return None
 
@@ -402,14 +555,14 @@ def read_veotime_to_daily(path: str, emp_master: pd.DataFrame, cfg: dict) -> pd.
     i_fecha = guess_col(cols_norm, ["fecha"])
     i_hora = guess_col(cols_norm, ["hora", "time"])
     i_marc = guess_col(cols_norm, ["marcaci", "marc", "tipo"])
-    i_dni = guess_col(cols_norm, ["dni", "documento", "legajo"])
+    i_id = guess_col(cols_norm, ["dni", "documento", "legajo", "id"])
     i_nombre = guess_col(cols_norm, ["nombre", "empleado", "apellido", "colaborador"])
 
     missing = []
     if i_fecha is None: missing.append("Fecha")
     if i_hora is None: missing.append("Hora")
     if i_marc is None: missing.append("Marcación")
-    if i_dni is None: missing.append("DNI")
+    if i_id is None: missing.append("DNI/ID/Legajo")
     if i_nombre is None: missing.append("Nombre")
 
     if missing:
@@ -417,18 +570,8 @@ def read_veotime_to_daily(path: str, emp_master: pd.DataFrame, cfg: dict) -> pd.
         debug_write_text(cfg, "debug_columnas.txt", "Columnas detectadas:\n" + "\n".join(f"- {c}" for c in df.columns))
         raise RuntimeError(
             "No pude detectar columnas clave en el reporte VeoTime.\n"
-            f"Faltan: {', '.join(missing)}\n\n"
-            "Tip: activá debug=true en config_horas_extra.json para guardar archivos de diagnóstico."
+            f"Faltan: {', '.join(missing)}"
         )
-
-    events = pd.DataFrame()
-    events["fecha"] = df.iloc[:, i_fecha].apply(parse_date)
-    events["hora"] = df.iloc[:, i_hora].apply(parse_time_only)
-    events["raw_id"] = df.iloc[:, i_dni].apply(clean_id)
-    events["dni8"] = events["raw_id"].apply(lambda x: split_cuil_to_dni(x)[0])
-
-    events["nombre_rep"] = df.iloc[:, i_nombre].astype(str).str.strip()
-    events["nombre_norm_rep"] = events["nombre_rep"].apply(normalize_text)
 
     def norm_tipo(x):
         t = normalize_text(x)
@@ -438,60 +581,93 @@ def read_veotime_to_daily(path: str, emp_master: pd.DataFrame, cfg: dict) -> pd.
             return "salida"
         return ""
 
+    events = pd.DataFrame()
+    events["fecha"] = df.iloc[:, i_fecha].apply(parse_date)
+    events["hora"] = df.iloc[:, i_hora].apply(parse_time_only)
     events["tipo"] = df.iloc[:, i_marc].apply(norm_tipo)
 
+    events["raw_id_rep"] = df.iloc[:, i_id].apply(clean_id).astype(str).str.strip()
+    parts = events["raw_id_rep"].apply(lambda x: pd.Series(
+        extract_id_parts(x),
+        index=["id_key_rep", "id_digits_rep", "id_cuil11_rep", "id_dni8_rep"]
+    ))
+    events = pd.concat([events, parts], axis=1)
+
+    events["nombre_rep"] = df.iloc[:, i_nombre].astype(str).str.strip()
+    nk = events["nombre_rep"].apply(lambda s: pd.Series(name_keys(s), index=["nombre_norm_rep", "nombre_first2_rep", "nombre_last2_rep"]))
+    events = pd.concat([events, nk], axis=1)
+
+    # filtros
     events = events.dropna(subset=["fecha", "hora"])
     events = events[events["tipo"].isin(["entrada", "salida"])]
-    events = events[events["dni8"] != ""]
+    events = events[events["id_key_rep"] != ""]
 
     if events.empty:
         debug_write_df(cfg, "debug_veotime_head.csv", df.head(200))
-        raise RuntimeError(
-            "No quedaron eventos válidos (Entrada/Salida).\n"
-            "Tip: activá debug=true para generar debug_veotime_head.csv."
-        )
+        raise RuntimeError("No quedaron eventos válidos (Entrada/Salida).")
 
-    # merge por dni8
-    merged = events.merge(emp_master, how="left", on="dni8", suffixes=("_rep", "_master"))
+    emp = emp_master.copy()
 
-    # fallback por nombre
-    no_match = merged["nombre_master"].isna()
-    if no_match.any():
-        emp_by_name = emp_master.drop_duplicates(subset=["nombre_norm_rep"], keep="first").copy()
+    # ---- mapeos por CLAVES ÚNICAS ----
+    def unique_map(key_col):
+        s = emp[[key_col, "midx"]].copy()
+        s[key_col] = s[key_col].fillna("").astype(str).str.strip()
+        s = s[s[key_col] != ""]
+        if s.empty:
+            return {}
+        vc = s[key_col].value_counts()
+        uniques = set(vc[vc == 1].index.astype(str))
+        s = s[s[key_col].isin(uniques)]
+        return dict(zip(s[key_col].astype(str), s["midx"]))
 
-        merged_no = merged.loc[no_match, ["nombre_norm_rep_rep"]].copy()
-        merged_no = merged_no.merge(
-            emp_by_name[["nombre_norm_rep", "empresa_master", "sector_master", "nombre_master",
-                        "jornada_weekday", "rate_lav", "rate_sab", "rate_domfer"]],
-            how="left",
-            left_on="nombre_norm_rep_rep",
-            right_on="nombre_norm_rep"
-        )
+    map_digits = unique_map("id_digits")
+    map_cuil = unique_map("id_cuil11")
+    map_dni8  = unique_map("id_dni8")
+    map_key   = unique_map("id_key")
 
-        for col in ["empresa_master", "sector_master", "nombre_master",
-                    "jornada_weekday", "rate_lav", "rate_sab", "rate_domfer"]:
-            merged.loc[no_match, col] = merged_no[col].values
+    map_name_full  = unique_map("nombre_norm")
+    map_name_f2    = unique_map("nombre_first2")
+    map_name_l2    = unique_map("nombre_last2")
 
-        debug_write_df(cfg, "debug_matcheados_por_nombre.csv", merged_no)
+    # ---- matching por ID primero ----
+    events["midx"] = events["id_digits_rep"].astype(str).map(map_digits)
+
+    mask = events["midx"].isna()
+    events.loc[mask, "midx"] = events.loc[mask, "id_cuil11_rep"].astype(str).map(map_cuil)
+
+    mask = events["midx"].isna()
+    events.loc[mask, "midx"] = events.loc[mask, "id_dni8_rep"].astype(str).map(map_dni8)
+
+    mask = events["midx"].isna()
+    events.loc[mask, "midx"] = events.loc[mask, "id_key_rep"].astype(str).map(map_key)
+
+    # ---- si no matcheó por ID, matcheo por nombre (robusto) ----
+    mask = events["midx"].isna()
+    events.loc[mask, "midx"] = events.loc[mask, "nombre_norm_rep"].astype(str).map(map_name_full)
+
+    mask = events["midx"].isna()
+    events.loc[mask, "midx"] = events.loc[mask, "nombre_first2_rep"].astype(str).map(map_name_f2)
+
+    mask = events["midx"].isna()
+    events.loc[mask, "midx"] = events.loc[mask, "nombre_last2_rep"].astype(str).map(map_name_l2)
+
+    merged = events.merge(emp, how="left", on="midx")
 
     still_no = merged["nombre_master"].isna()
     if still_no.any():
-        debug_write_df(cfg, "debug_no_matcheados.csv", merged.loc[still_no, ["dni8", "nombre_rep"]].drop_duplicates())
+        debug_write_df(cfg, "debug_no_matcheados.csv",
+                       merged.loc[still_no, ["raw_id_rep", "id_key_rep", "nombre_rep"]].drop_duplicates())
 
-    # empresa / sector / nombre finales
+    # finales
     merged["empresa_final"] = merged["empresa_master"].fillna("").astype(str).str.strip()
-    merged["empresa_final"] = merged["empresa_final"].where(
-        merged["empresa_final"] != "", cfg.get("company_name", "TALCA")
-    )
+    merged["empresa_final"] = merged["empresa_final"].where(merged["empresa_final"] != "", cfg.get("company_name", "TALCA"))
 
     merged["sector_final"] = merged["sector_master"].fillna("").astype(str).str.strip()
     merged["sector_final"] = merged["sector_final"].where(merged["sector_final"] != "", "desconocido")
     merged["sector_final"] = merged["sector_final"].apply(normalize_text)
 
     merged["nombre_final"] = merged["nombre_master"].fillna("").astype(str).str.strip()
-    merged["nombre_final"] = merged["nombre_final"].where(
-        merged["nombre_final"] != "", merged["nombre_rep"].fillna("").astype(str)
-    )
+    merged["nombre_final"] = merged["nombre_final"].where(merged["nombre_final"] != "", merged["nombre_rep"].fillna("").astype(str))
 
     merged["jornada_weekday"] = merged["jornada_weekday"].fillna(float(cfg.get("default_jornada_weekday", 8)))
     merged.loc[merged["jornada_weekday"] <= 0, "jornada_weekday"] = float(cfg.get("default_jornada_weekday", 8))
@@ -500,48 +676,126 @@ def read_veotime_to_daily(path: str, emp_master: pd.DataFrame, cfg: dict) -> pd.
     merged["rate_sab"] = merged["rate_sab"].fillna(0.0)
     merged["rate_domfer"] = merged["rate_domfer"].fillna(0.0)
 
-    # construir diario (pair entrada->salida)
-    daily_rows = []
-    for (dni8, empresa, nombre, sector, fecha, jornada, rlav, rsab, rdom), sub in merged.groupby(
-        ["dni8", "empresa_final", "nombre_final", "sector_final", "fecha",
-         "jornada_weekday", "rate_lav", "rate_sab", "rate_domfer"],
-        dropna=False
-    ):
-        sub = sub.sort_values("hora")
-        last_entry = None
-        total_hs = 0.0
+    # ID final: escribe SIEMPRE el ID del master si existe
+    merged["id_display_final"] = merged["id_master_display"].fillna("").astype(str).str.strip()
+    merged["id_display_final"] = merged["id_display_final"].where(
+        merged["id_display_final"] != "", merged["raw_id_rep"].fillna("").astype(str).str.strip()
+    )
 
-        for _, r in sub.iterrows():
-            if r["tipo"] == "entrada":
-                last_entry = r["hora"]
-            else:
-                if last_entry is not None:
-                    start_dt = datetime.combine(fecha, last_entry)
-                    end_dt = datetime.combine(fecha, r["hora"])
-                    total_hs += hours_between(start_dt, end_dt)
-                    last_entry = None
+    # clave interna estable para agrupar
+    merged["id_key_final"] = merged["id_key"].fillna("").astype(str).str.strip()
+    merged["id_key_final"] = merged["id_key_final"].where(
+        merged["id_key_final"] != "", merged["id_key_rep"].fillna("").astype(str).str.strip()
+    )
 
-        daily_rows.append({
-            "dni": str(dni8),
+    # =========================================================
+    # CONSTRUIR HORAS DIARIAS (TURNO NOCTURNO)
+    # - Redondeo a hora más cercana (no minutos)
+    # - Empareja Entrada -> Salida aunque sea al día siguiente
+    # - Asigna TODAS las horas al día de la ENTRADA (como hace RRHH)
+    # - Si cruza medianoche: suma +1 hora extra (bonus nocturno) al día de entrada
+    # =========================================================
+
+    # datetime crudo (fecha + hora)
+    merged["dt_raw"] = merged.apply(
+        lambda r: datetime.combine(r["fecha"], r["hora"]) if (
+                    r["fecha"] is not None and r["hora"] is not None) else None,
+        axis=1
+    )
+    merged = merged.dropna(subset=["dt_raw"]).copy()
+
+    # redondeo a la hora mas cercana
+    merged["dt"] = merged["dt_raw"].apply(round_dt_to_nearest_hour)
+
+    # acumulador por (dni, fecha_asignada)
+    acc = {}
+
+    def get_rec(static, dte: date):
+        k = (static["dni"], dte)
+        if k not in acc:
+            acc[k] = {
+                "dni": static["dni"],
+                "dni_display": static["dni_display"],
+                "empresa": static["empresa"],
+                "nombre": static["nombre"],
+                "sector": static["sector"],
+                "fecha": dte,
+                "horas_trab": 0,  # horas enteras ya redondeadas
+                "night_bonus": 0,  # +1 si cruzo medianoche
+                "jornada_weekday": static["jornada_weekday"],
+                "rate_lav": static["rate_lav"],
+                "rate_sab": static["rate_sab"],
+                "rate_domfer": static["rate_domfer"],
+            }
+        return acc[k]
+
+    # agrupamos por empleado (sin fecha), así emparejamos turnos cruzando días
+    emp_group_cols = [
+        "id_key_final", "id_display_final",
+        "empresa_final", "nombre_final", "sector_final",
+        "jornada_weekday", "rate_lav", "rate_sab", "rate_domfer"
+    ]
+
+    for key, sub in merged.groupby(emp_group_cols, dropna=False):
+        (idkey, iddisp, empresa, nombre, sector, jornada, rlav, rsab, rdom) = key
+
+        static = {
+            "dni": str(idkey).strip(),
+            "dni_display": str(iddisp).strip() if str(iddisp).strip() else str(idkey).strip(),
             "empresa": str(empresa),
             "nombre": str(nombre),
             "sector": str(sector),
-            "fecha": fecha,
-            "horas_trab": float(total_hs),
             "jornada_weekday": float(jornada),
             "rate_lav": float(rlav),
             "rate_sab": float(rsab),
-            "rate_domfer": float(rdom)
-        })
+            "rate_domfer": float(rdom),
+        }
 
-    daily = pd.DataFrame(daily_rows)
+        if not static["dni"]:
+            continue
+
+        sub = sub.sort_values("dt")
+
+        open_entry = None
+
+        for _, r in sub.iterrows():
+            if r["tipo"] == "entrada":
+                # si había otra entrada abierta, nos quedamos con la más reciente
+                open_entry = r["dt"]
+                continue
+
+            if r["tipo"] == "salida" and open_entry is not None:
+                end_dt = r["dt"]
+
+                # si por cualquier motivo quedó mal ordenado, lo reacomodamos
+                while end_dt <= open_entry:
+                    end_dt = end_dt + timedelta(days=1)
+
+                # horas enteras
+                hs = int((end_dt - open_entry).total_seconds() // 3600)
+                if hs < 0:
+                    hs = 0
+
+                day_assigned = open_entry.date()  # TODO va al día de la entrada
+                rec = get_rec(static, day_assigned)
+                rec["horas_trab"] += hs
+
+                # bonus nocturno si cruza medianoche (entrada un día, salida otro)
+                if open_entry.date() != end_dt.date():
+                    rec["night_bonus"] += 1
+
+                open_entry = None
+
+        # si queda una entrada sin salida -> no cuenta (queda 0), como pediste
+
+    daily = pd.DataFrame(list(acc.values()))
     if daily.empty:
-        raise RuntimeError("No pude construir horas diarias.")
+        raise RuntimeError("No pude construir horas diarias (no se formaron pares Entrada/Salida).")
     return daily
 
 
 # ============================================================
-# OVERTIME (HORAS REDONDAS)
+# OVERTIME (CORREGIDO: SIN FLOOR + REGLA TALCA)
 # ============================================================
 def compute_overtime_from_daily(daily: pd.DataFrame, cfg: dict) -> dict:
     d = daily.copy()
@@ -549,30 +803,15 @@ def compute_overtime_from_daily(daily: pd.DataFrame, cfg: dict) -> dict:
     d["dow"] = d["fecha"].apply(lambda x: x.weekday())
     d["dow_key"] = d["dow"].map(DOW_MAP)
 
-    def std_hours(row):
-        # FERIADO: se calcula igual que un día normal (toma jornada si holiday_standard_hours=0)
-        if is_holiday(row["fecha"], cfg):
-            hs = float(cfg.get("holiday_standard_hours", 0))
-            if hs <= 0:
-                hs = float(row["jornada_weekday"])
-            return hs
+    # todo entero
+    d["horas_trab"] = pd.to_numeric(d["horas_trab"], errors="coerce").fillna(0).astype(int)
+    d["jornada_weekday"] = pd.to_numeric(d["jornada_weekday"], errors="coerce").fillna(0).astype(int)
+    d["night_bonus"] = pd.to_numeric(d.get("night_bonus", 0), errors="coerce").fillna(0).astype(int)
 
-        if row["dow_key"] == "Sun":
-            return float(cfg.get("sunday_standard_hours", 0))
+    base_extra = (d["horas_trab"] - d["jornada_weekday"]).clip(lower=0).astype(int)
+    d["horas_extra"] = (base_extra + d["night_bonus"]).astype(int)
 
-        if row["dow_key"] == "Sat":
-            return float(cfg.get("saturday_standard_hours", 8))
-
-        return float(row["jornada_weekday"])
-
-    d["std"] = d.apply(std_hours, axis=1)
-
-    # redondeo hacia abajo: 8:55 a 13:02 => 4hs
-    d["horas_trab_red"] = d["horas_trab"].apply(lambda x: math.floor(float(x)))
-    d["std_red"] = d["std"].apply(lambda x: math.floor(float(x)))
-
-    d["horas_extra"] = (d["horas_trab_red"] - d["std_red"]).clip(lower=0)
-
+    # tarifa según el día donde se escribe (día asignado = día de entrada)
     def rate_for(row):
         if is_holiday(row["fecha"], cfg) or row["dow_key"] == "Sun":
             return float(row["rate_domfer"])
@@ -587,7 +826,6 @@ def compute_overtime_from_daily(daily: pd.DataFrame, cfg: dict) -> dict:
     for week_start, sub in d.groupby("semana_lunes"):
         weeks[week_start] = sub.copy()
     return weeks
-
 
 # ============================================================
 # TEMPLATE HELPERS
@@ -618,7 +856,6 @@ def _ensure_rows(ws, start_row, n_rows_needed, base_style_row=7):
             src = ws.cell(base_style_row, c)
             dst = ws.cell(r, c)
 
-            # estilos
             dst._style = copy(src._style)
             dst.font = copy(src.font)
             dst.border = copy(src.border)
@@ -627,7 +864,6 @@ def _ensure_rows(ws, start_row, n_rows_needed, base_style_row=7):
             dst.protection = copy(src.protection)
             dst.alignment = copy(src.alignment)
 
-            # valores + fórmulas (si la celda base tiene fórmula, la traducimos a la nueva fila)
             v = src.value
             if isinstance(v, str) and v.startswith("="):
                 try:
@@ -636,7 +872,6 @@ def _ensure_rows(ws, start_row, n_rows_needed, base_style_row=7):
                     dst.value = v
             else:
                 dst.value = v
-
 
 
 def _set_week_header(ws, week_start: date, cfg: dict):
@@ -655,7 +890,6 @@ def _set_week_header(ws, week_start: date, cfg: dict):
         cell.value = d
         cell.number_format = "dd/mm/yy"
 
-    # Si hay 1+ feriados en la semana, mostramos el primero en el header
     hol = None
     for i in range(-1, 6):
         d = week_start + timedelta(days=i)
@@ -667,55 +901,41 @@ def _set_week_header(ws, week_start: date, cfg: dict):
 
 
 def _clear_data_area(ws, start_row=7):
-    """
-    Limpia SOLO lo que es "dato de empleado" y horas (A..L) + tarifas (M..O),
-    pero NO borra las columnas de cálculos (fórmulas) que están más a la derecha.
-    """
     for r in range(start_row, ws.max_row + 1):
-        # A..D (empresa, sector, legajo, nombre)
         for c in range(1, 5):
             ws.cell(r, c).value = None
 
-        # E..L (horas por día)
+        # Horas (E..L) con decimales
         for c in range(5, 13):
             ws.cell(r, c).value = 0
-            ws.cell(r, c).number_format = "0"
+            ws.cell(r, c).number_format = "0.00"
             ws.cell(r, c).alignment = Alignment(horizontal="center", vertical="center")
 
-        # M..O (tarifas $/h LaV, Sab, Dom/Fer) -> las dejamos en 0 hasta cargar
         for c in range(13, 16):
             ws.cell(r, c).value = 0
             ws.cell(r, c).number_format = "#,##0"
             ws.cell(r, c).alignment = Alignment(horizontal="center", vertical="center")
 
 
-
 # ============================================================
 # TEMPLATE: asegurar _TEMPLATE oculta dentro del workbook de salida
-# (para poder copiar hojas dentro del MISMO archivo)
 # ============================================================
 def clone_template_sheet_into_workbook(wb_dest, template_path: str) -> None:
-    """
-    Crea una hoja _TEMPLATE en wb_dest copiando celdas/estilos desde template_path.
-    (sirve cuando el Excel existente NO tenía _TEMPLATE).
-    """
     src_wb = load_workbook(template_path)
     src = src_wb.active
 
     if TEMPLATE_SHEET_NAME in wb_dest.sheetnames:
+        src_wb.close()
         return
 
     dst = wb_dest.create_sheet(TEMPLATE_SHEET_NAME)
 
-    # tamaños de columnas
     for col_letter, dim in src.column_dimensions.items():
         dst.column_dimensions[col_letter].width = dim.width
 
-    # alturas de filas
     for row_idx, dim in src.row_dimensions.items():
         dst.row_dimensions[row_idx].height = dim.height
 
-    # celdas + estilos
     for row in src.iter_rows():
         for cell in row:
             new_cell = dst.cell(row=cell.row, column=cell.column, value=cell.value)
@@ -728,11 +948,9 @@ def clone_template_sheet_into_workbook(wb_dest, template_path: str) -> None:
                 new_cell.protection = copy(cell.protection)
                 new_cell.alignment = copy(cell.alignment)
 
-    # merges
     for m in src.merged_cells.ranges:
         dst.merge_cells(str(m))
 
-    # propiedades de hoja (básicas)
     dst.sheet_view.showGridLines = src.sheet_view.showGridLines
     dst.page_setup = copy(src.page_setup)
     dst.page_margins = copy(src.page_margins)
@@ -741,32 +959,20 @@ def clone_template_sheet_into_workbook(wb_dest, template_path: str) -> None:
 
 
 def ensure_hidden_template(wb, template_path: str):
-    """
-    Garantiza que exista una hoja _TEMPLATE y quede veryHidden (no visible en Excel).
-    Devuelve el worksheet template.
-    """
-    # si existe template con otro nombre "TEMPLATE", lo renombramos
     if TEMPLATE_SHEET_NAME not in wb.sheetnames:
         if "TEMPLATE" in wb.sheetnames:
             ws = wb["TEMPLATE"]
             ws.title = TEMPLATE_SHEET_NAME
 
     if TEMPLATE_SHEET_NAME not in wb.sheetnames:
-        # inyectar desde archivo template
         clone_template_sheet_into_workbook(wb, template_path)
 
     tpl = wb[TEMPLATE_SHEET_NAME]
-    # ocultar fuerte
     tpl.sheet_state = "veryHidden"
     return tpl
 
 
 def find_week_sheet(wb, week_start: date):
-    """
-    Busca la hoja de una semana:
-    1) por nombre exacto "Semana dd-mm"
-    2) por header (celda F4 = lunes)
-    """
     target_title = _safe_sheet_title(f"Semana {week_start.strftime('%d-%m')}")
     if target_title in wb.sheetnames:
         return wb[target_title]
@@ -794,23 +1000,16 @@ def get_or_create_week_sheet(wb, tpl, week_start: date, cfg: dict):
         _clear_data_area(ws, start_row=7)
         created_new = True
     else:
-        # Si ya existía, NO borramos nada. Solo aseguramos header coherente
         _set_week_header(ws, week_start, cfg)
 
     return ws, created_new
 
 
 def read_existing_employee_rows(ws, start_row=7):
-    """
-    Devuelve:
-    - dict dni->row
-    - next_insert_row (primera fila libre debajo del último empleado)
-    """
-    row_by_dni = {}
+    row_by_key = {}
     last_filled = start_row - 1
-
     empty_run = 0
-    # ojo: algunos templates tienen max_row enorme, cortamos por "muchas filas vacías seguidas"
+
     for r in range(start_row, ws.max_row + 1):
         a = ws.cell(r, 1).value
         b = ws.cell(r, 2).value
@@ -822,41 +1021,34 @@ def read_existing_employee_rows(ws, start_row=7):
         if has_data:
             empty_run = 0
             last_filled = r
-            dni = str(c).strip() if c not in (None, "") else ""
-            if dni:
-                row_by_dni[dni] = r
+            k = id_key_from_any(c)  # <-- clave estable aunque tenga guiones/ceros
+            if k:
+                row_by_key[k] = r
         else:
             empty_run += 1
             if empty_run >= 30 and r > start_row + 30:
                 break
 
-    return row_by_dni, (last_filled + 1)
+    return row_by_key, (last_filled + 1)
 
 
-def num_or_zero(v):
-    try:
-        if v is None or v == "":
-            return 0.0
-        return float(v)
-    except Exception:
-        return 0.0
-
-def _ensure_row_formulas_from_base(ws, target_row, base_row=7, max_col=30):
-    """
-    Si en la fila base hay fórmulas, las copia/ajusta a la fila target.
-    Sirve para arreglar archivos que quedaron sin fórmulas en filas nuevas.
-    """
+def _ensure_row_formulas_from_base(ws, target_row, base_row=7, max_col=30, skip_cols=None):
+    skip_cols = set(skip_cols or [])
     for c in range(1, max_col + 1):
+        if c in skip_cols:
+            continue
         src = ws.cell(base_row, c)
         v = src.value
         if isinstance(v, str) and v.startswith("="):
             dst = ws.cell(target_row, c)
-            # si no hay fórmula, la ponemos (o si hay número porque antes la pisamos)
-            if not (isinstance(dst.value, str) and dst.value.startswith("=")):
-                try:
-                    dst.value = Translator(v, origin=src.coordinate).translate_formula(dst.coordinate)
-                except Exception:
-                    dst.value = v
+            # si ya hay una formula, no tocar
+            if isinstance(dst.value, str) and dst.value.startswith("="):
+                continue
+            try:
+                dst.value = Translator(v, origin=src.coordinate).translate_formula(dst.coordinate)
+            except Exception:
+                dst.value = v
+
 
 
 def upsert_week_employees(ws, df_week: pd.DataFrame, cfg: dict):
@@ -865,25 +1057,29 @@ def upsert_week_employees(ws, df_week: pd.DataFrame, cfg: dict):
 
     sub = df_week.copy()
 
+    # agrupar horas extra por empleado y día
     day_he = (
-        sub.groupby(["empresa", "dni", "nombre", "sector", "fecha", "rate_lav", "rate_sab", "rate_domfer"], dropna=False)["horas_extra"]
+        sub.groupby(
+            ["empresa", "dni", "dni_display", "nombre", "sector", "fecha", "rate_lav", "rate_sab", "rate_domfer"],
+            dropna=False
+        )["horas_extra"]
         .sum()
         .reset_index()
     )
 
     employees = (
-        day_he[["empresa", "dni", "nombre", "sector", "rate_lav", "rate_sab", "rate_domfer"]]
+        day_he[["empresa", "dni", "dni_display", "nombre", "sector", "rate_lav", "rate_sab", "rate_domfer"]]
         .drop_duplicates()
         .sort_values(["empresa", "sector", "nombre"])
     )
 
-    # mapa horas extra por dni y fecha
+    # mapa horas extra por key interna y fecha (AHORA float, no int)
     he_map = {}
     for _, r in day_he.iterrows():
-        dni = str(r["dni"]).strip()
-        he_map.setdefault(dni, {})[r["fecha"]] = int(float(r["horas_extra"]))
+        k = str(r["dni"]).strip()
+        he_map.setdefault(k, {})[r["fecha"]] = float(r["horas_extra"])
 
-    row_by_dni, next_row = read_existing_employee_rows(ws, start_row=7)
+    row_by_key, next_row = read_existing_employee_rows(ws, start_row=7)
 
     _ensure_rows(ws, start_row=7, n_rows_needed=max(10, next_row - 6 + len(employees)), base_style_row=7)
 
@@ -891,7 +1087,8 @@ def upsert_week_employees(ws, df_week: pd.DataFrame, cfg: dict):
 
     for _, emp in employees.iterrows():
         empresa = str(emp["empresa"])
-        dni = str(emp["dni"]).strip()
+        key_internal = str(emp["dni"]).strip()
+        dni_display = str(emp.get("dni_display", "")).strip() or key_internal
         nombre = str(emp["nombre"])
         sector = str(emp["sector"])
 
@@ -899,84 +1096,88 @@ def upsert_week_employees(ws, df_week: pd.DataFrame, cfg: dict):
         rate_sab = float(emp["rate_sab"])
         rate_domfer = float(emp["rate_domfer"])
 
-        if not dni:
+        if not key_internal:
             continue
 
-        if dni in row_by_dni:
-            row = row_by_dni[dni]
+        if key_internal in row_by_key:
+            row = row_by_key[key_internal]
             is_new = False
         else:
             row = next_row
             next_row += 1
-            row_by_dni[dni] = row
+            row_by_key[key_internal] = row
             is_new = True
 
         # A..D
         ws.cell(row, 1).value = empresa
         ws.cell(row, 2).value = sector
-        ws.cell(row, 3).value = dni
+        ws.cell(row, 3).value = dni_display   # <-- SIEMPRE el ID del master si existe
         ws.cell(row, 4).value = nombre
 
-        # Tarifas M..O (13..15)
-        ws.cell(row, 13).value = round(rate_lav, 0)
-        ws.cell(row, 14).value = round(rate_sab, 0)
-        ws.cell(row, 15).value = round(rate_domfer, 0)
-        for c in (13, 14, 15):
-            ws.cell(row, c).number_format = "#,##0"
-            ws.cell(row, c).alignment = Alignment(horizontal="center", vertical="center")
-
-        # Si es fila nueva, inicializamos horas E..L en 0 (por si no viene algo del template)
+        # Si es fila nueva, inicializamos horas E..L en 0 (con decimales)
         if is_new:
             for c in range(5, 13):
                 ws.cell(row, c).value = 0
-                ws.cell(row, c).number_format = "0"
+                ws.cell(row, c).number_format = "0.00"
                 ws.cell(row, c).alignment = Alignment(horizontal="center", vertical="center")
 
         # Horas extra por fecha (E..L)
-        emp_he_by_date = he_map.get(dni, {})
+
+        emp_he_by_date = he_map.get(key_internal, {})
         for dte, he in emp_he_by_date.items():
+            he = float(he)
             if he <= 0:
                 continue
             col = _col_for_date(dte, cfg)
-            cur = ws.cell(row, col).value
+            cur = num_or_zero(ws.cell(row, col).value)
 
             if merge_mode == "replace":
                 new_val = he
             else:
-                new_val = int(num_or_zero(cur)) + int(he)
+                new_val = cur + he
 
+            new_val = round(new_val, 2)
             ws.cell(row, col).value = new_val
-            ws.cell(row, col).number_format = "0"
+            ws.cell(row, col).number_format = "0.00"
             ws.cell(row, col).alignment = Alignment(horizontal="center", vertical="center")
 
-        # Asegurar fórmulas en la fila (por si antes quedaron pisadas o vacías)
-        _ensure_row_formulas_from_base(ws, target_row=row, base_row=7, max_col=max(ws.max_column, 30))
+        force_integer_hours_format(ws, row, 5, 12)
 
+        # Asegurar fórmulas en la fila
+        _ensure_row_formulas_from_base(
+            ws,
+            target_row=row,
+            base_row=7,
+            max_col=max(ws.max_column, 30),
+            skip_cols={13, 14, 15}  # NO tocar M,N,O porque ahora son montos calculados
+        )
+
+        # --- Luego de cargar horas E..L, calculamos montos M..O ---
+        amt_weekday, amt_sat, amt_domfer = compute_amounts_for_row(ws, row, rate_lav, rate_sab, rate_domfer)
+
+        ws.cell(row, 13).value = amt_weekday   # M: $ L a V
+        ws.cell(row, 14).value = amt_sat       # N: $ Sábado
+        ws.cell(row, 15).value = amt_domfer    # O: $ Dom y Fer
+
+        for c in (13, 14, 15):
+            ws.cell(row, c).number_format = '"$"#,##0'
+            ws.cell(row, c).alignment = Alignment(horizontal="center", vertical="center")
 
 
 def update_or_build_output_workbook(weeks: dict, out_path: str, template_path: str, cfg: dict):
-    """
-    - Si out_path existe: actualiza (append empleados).
-    - Si no existe: crea nuevo desde template (pero _TEMPLATE queda oculta).
-    """
     if os.path.exists(out_path):
         wb = load_workbook(out_path)
         tpl = ensure_hidden_template(wb, template_path)
     else:
         wb = load_workbook(template_path)
-        # renombrar/asegurar template dentro del nuevo workbook
         tpl0 = wb.active
         tpl0.title = TEMPLATE_SHEET_NAME
         tpl = ensure_hidden_template(wb, template_path)
 
-    created_any = False
-
     for week_start, df_week in sorted(weeks.items(), key=lambda x: x[0]):
-        ws, created_new = get_or_create_week_sheet(wb, tpl, week_start, cfg)
-        created_any = created_any or created_new
+        ws, _created_new = get_or_create_week_sheet(wb, tpl, week_start, cfg)
         upsert_week_employees(ws, df_week, cfg)
 
-    # asegurar template oculto siempre
     if TEMPLATE_SHEET_NAME in wb.sheetnames:
         wb[TEMPLATE_SHEET_NAME].sheet_state = "veryHidden"
 
@@ -990,6 +1191,7 @@ def update_or_build_output_workbook(weeks: dict, out_path: str, template_path: s
 # UI + CALENDARIO INLINE
 # ============================================================
 def run_app():
+
     cfg = load_config()
 
     try:
@@ -1052,7 +1254,7 @@ def run_app():
 
             cols_norm = [normalize_text(c) for c in df.columns]
             i_fecha = guess_col(cols_norm, ["fecha"])
-            i_dni = guess_col(cols_norm, ["dni", "documento", "legajo"])
+            i_id = guess_col(cols_norm, ["dni", "documento", "legajo", "id"])
 
             if i_fecha is None:
                 return None, None, None
@@ -1065,12 +1267,12 @@ def run_app():
             end = max(fechas)
 
             emps = None
-            if i_dni is not None:
-                tmp = df.iloc[:, i_dni].apply(clean_id)
-                dni8 = tmp.apply(lambda x: split_cuil_to_dni(x)[0])
-                dni8 = dni8[dni8 != ""]
-                if not dni8.empty:
-                    emps = int(dni8.nunique())
+            if i_id is not None:
+                tmp = df.iloc[:, i_id].apply(clean_id)
+                keys = tmp.apply(id_key_from_any)
+                keys = keys[keys != ""]
+                if not keys.empty:
+                    emps = int(keys.nunique())
 
             return start, end, emps
         except Exception:
