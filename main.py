@@ -363,26 +363,31 @@ def force_integer_hours_format(ws, row, col_start=5, col_end=12):
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
-def compute_amounts_for_row(ws, row, rate_lav, rate_sab, rate_domfer):
-    # Columnas horas (según tu plantilla):
-    # Dom=5, Lun=6, Mar=7, Mier=8, Jue=9, Vie=10, Sab=11, Feriado=12
-    hours_dom = num_or_zero(ws.cell(row, 5).value)
-    hours_lun = num_or_zero(ws.cell(row, 6).value)
-    hours_mar = num_or_zero(ws.cell(row, 7).value)
-    hours_mie = num_or_zero(ws.cell(row, 8).value)
-    hours_jue = num_or_zero(ws.cell(row, 9).value)
-    hours_vie = num_or_zero(ws.cell(row, 10).value)
-    hours_sab = num_or_zero(ws.cell(row, 11).value)
-    hours_fer = num_or_zero(ws.cell(row, 12).value)
+def compute_amounts_for_row(ws, row, rate_lav, rate_sab, rate_domfer, holiday_cols):
+    # Columnas horas base:
+    # Dom=5, Lun=6, Mar=7, Mier=8, Jue=9, Vie=10, Sab=11
+    hours_dom = int(num_or_zero(ws.cell(row, 5).value))
+    hours_lun = int(num_or_zero(ws.cell(row, 6).value))
+    hours_mar = int(num_or_zero(ws.cell(row, 7).value))
+    hours_mie = int(num_or_zero(ws.cell(row, 8).value))
+    hours_jue = int(num_or_zero(ws.cell(row, 9).value))
+    hours_vie = int(num_or_zero(ws.cell(row, 10).value))
+    hours_sab = int(num_or_zero(ws.cell(row, 11).value))
+
+    # Feriados: sumatoria de TODAS las columnas "FERIADO"
+    hours_fer_total = 0
+    for c in holiday_cols:
+        hours_fer_total += int(num_or_zero(ws.cell(row, c).value))
 
     hours_weekday = hours_lun + hours_mar + hours_mie + hours_jue + hours_vie
-    hours_domfer = hours_dom + hours_fer
+    hours_domfer = hours_dom + hours_fer_total
 
     amt_weekday = int(round(hours_weekday * float(rate_lav), 0))
     amt_sat = int(round(hours_sab * float(rate_sab), 0))
     amt_domfer = int(round(hours_domfer * float(rate_domfer), 0))
 
     return amt_weekday, amt_sat, amt_domfer
+
 
 
 # ============================================================
@@ -834,14 +839,58 @@ def _safe_sheet_title(s: str) -> str:
     s = re.sub(r'[\\/*?:\[\]]', '-', str(s))
     return s[:31].strip() or "Semana"
 
+def get_week_holidays(week_start: date, cfg: dict):
+    """
+    Devuelve feriados de la semana (Lun..Sab).
+    Ojo: Dom ya tiene su columna propia, así que no creamos columna "FERIADO" para domingo.
+    """
+    hols = []
+    for i in range(0, 6):  # Lun..Sab
+        d = week_start + timedelta(days=i)
+        if is_holiday(d, cfg):
+            hols.append(d)
+    hols.sort()
+    return hols
 
-def _col_for_date(d: date, cfg: dict) -> int:
-    # En tu plantilla: Dom=5, Lun=6, ... Sab=11, Feriado=12
-    if is_holiday(d, cfg):
-        return 12
+
+def get_holiday_cols(ws, base_col=12, header_row=3):
+    """
+    Devuelve las columnas consecutivas que dicen 'FERIADO' en el header (fila 3),
+    empezando en la columna 12.
+    """
+    cols = []
+    c = base_col
+    while True:
+        v = normalize_text(ws.cell(header_row, c).value)
+        if v == "feriado":
+            cols.append(c)
+            c += 1
+        else:
+            break
+
+    # fallback por si la plantilla no trae el texto
+    if not cols:
+        cols = [base_col]
+    return cols
+
+
+def _col_for_date(ws, d: date, cfg: dict) -> int:
+    # Dom siempre va a su columna (aunque sea feriado)
     if d.weekday() == 6:
         return 5
-    return 6 + d.weekday()
+
+    # Si es feriado (Lun..Sab), buscar su columna por fecha en el header
+    if is_holiday(d, cfg):
+        hol_cols = get_holiday_cols(ws, base_col=12)
+        for c in hol_cols:
+            hd = excel_cell_to_date(ws.cell(4, c).value)
+            if hd == d:
+                return c
+        return hol_cols[0] if hol_cols else 12
+
+    # Lun..Sab normal
+    return 6 + d.weekday()  # Lun=6 ... Sab=11
+
 
 
 def _ensure_rows(ws, start_row, n_rows_needed, base_style_row=7):
@@ -875,6 +924,7 @@ def _ensure_rows(ws, start_row, n_rows_needed, base_style_row=7):
 
 
 def _set_week_header(ws, week_start: date, cfg: dict):
+    # Dom..Sab
     sun = week_start - timedelta(days=1)
     dates = [
         (5, sun),
@@ -890,31 +940,83 @@ def _set_week_header(ws, week_start: date, cfg: dict):
         cell.value = d
         cell.number_format = "dd/mm/yy"
 
-    hol = None
-    for i in range(-1, 6):
-        d = week_start + timedelta(days=i)
-        if is_holiday(d, cfg):
-            hol = d
-            break
-    ws.cell(4, 12).value = hol if hol else None
-    ws.cell(4, 12).number_format = "dd/mm/yy"
+    # --- feriados de la semana (Lun..Sab) ---
+    hol_dates = get_week_holidays(week_start, cfg)
+    desired = max(1, len(hol_dates))
+
+    hol_cols = get_holiday_cols(ws, base_col=12)
+    current = len(hol_cols)
+
+    # Si hacen falta más columnas FER IADO, insertarlas antes de los $/h
+    if desired > current:
+        insert_at = 12 + current  # justo después del último feriado actual
+        for _ in range(desired - current):
+            ws.insert_cols(insert_at)
+
+            # Copiar estilo del col 12 (primer FER IADO) a la nueva columna
+            for r in range(1, ws.max_row + 1):
+                src = ws.cell(r, 12)
+                dst = ws.cell(r, insert_at)
+                if src.has_style:
+                    dst._style = copy(src._style)
+                    dst.font = copy(src.font)
+                    dst.border = copy(src.border)
+                    dst.fill = copy(src.fill)
+                    dst.number_format = src.number_format
+                    dst.protection = copy(src.protection)
+                    dst.alignment = copy(src.alignment)
+
+            # headers mínimos
+            if not ws.cell(3, insert_at).value:
+                ws.cell(3, insert_at).value = ws.cell(3, 12).value or "FERIADO"
+            if not ws.cell(5, insert_at).value:
+                ws.cell(5, insert_at).value = ws.cell(5, 12).value or "Hs"
+
+            insert_at += 1
+
+        hol_cols = get_holiday_cols(ws, base_col=12)
+
+    # Poner fechas en cada columna FER IADO (fila 4)
+    for i, c in enumerate(hol_cols):
+        d = hol_dates[i] if i < len(hol_dates) else None
+        cell = ws.cell(4, c)
+        cell.value = d
+        cell.number_format = "dd/mm/yy"
 
 
 def _clear_data_area(ws, start_row=7):
+    hol_cols = get_holiday_cols(ws, base_col=12)
+    last_hol = hol_cols[-1] if hol_cols else 12
+
+    col_amt_wd = last_hol + 1
+    col_amt_sat = last_hol + 2
+    col_amt_domfer = last_hol + 3
+    col_subtotal = last_hol + 4
+    col_redondeo = last_hol + 5
+
     for r in range(start_row, ws.max_row + 1):
+        # A..D
         for c in range(1, 5):
             ws.cell(r, c).value = None
 
-        # Horas (E..L) con decimales
-        for c in range(5, 13):
+        # Dom..Sab (E..K) enteras
+        for c in range(5, 12):
             ws.cell(r, c).value = 0
-            ws.cell(r, c).number_format = "0.00"
+            ws.cell(r, c).number_format = "0"
             ws.cell(r, c).alignment = Alignment(horizontal="center", vertical="center")
 
-        for c in range(13, 16):
+        # Feriados (todas las columnas FER IADO)
+        for c in hol_cols:
             ws.cell(r, c).value = 0
-            ws.cell(r, c).number_format = "#,##0"
+            ws.cell(r, c).number_format = "0"
             ws.cell(r, c).alignment = Alignment(horizontal="center", vertical="center")
+
+        # Montos + subtotal + redondeo
+        for c in (col_amt_wd, col_amt_sat, col_amt_domfer, col_subtotal, col_redondeo):
+            ws.cell(r, c).value = 0
+            ws.cell(r, c).number_format = '"$"#,##0'
+            ws.cell(r, c).alignment = Alignment(horizontal="center", vertical="center")
+
 
 
 # ============================================================
@@ -1055,6 +1157,17 @@ def upsert_week_employees(ws, df_week: pd.DataFrame, cfg: dict):
     if df_week is None or df_week.empty:
         return
 
+    # columnas feriado reales en esta hoja
+    holiday_cols = get_holiday_cols(ws, base_col=12)
+    last_hol = holiday_cols[-1] if holiday_cols else 12
+
+    # columnas de montos (se corren automáticamente si agregamos feriados)
+    col_amt_wd = last_hol + 1
+    col_amt_sat = last_hol + 2
+    col_amt_domfer = last_hol + 3
+    col_subtotal = last_hol + 4
+    col_redondeo = last_hol + 5
+
     sub = df_week.copy()
 
     # agrupar horas extra por empleado y día
@@ -1073,15 +1186,21 @@ def upsert_week_employees(ws, df_week: pd.DataFrame, cfg: dict):
         .sort_values(["empresa", "sector", "nombre"])
     )
 
-    # mapa horas extra por key interna y fecha (AHORA float, no int)
+    # mapa horas extra por dni y fecha (enteras)
     he_map = {}
     for _, r in day_he.iterrows():
         k = str(r["dni"]).strip()
-        he_map.setdefault(k, {})[r["fecha"]] = float(r["horas_extra"])
+        he_map.setdefault(k, {})[r["fecha"]] = int(r["horas_extra"])
 
     row_by_key, next_row = read_existing_employee_rows(ws, start_row=7)
 
-    _ensure_rows(ws, start_row=7, n_rows_needed=max(10, next_row - 6 + len(employees)), base_style_row=7)
+    # asegurar filas suficientes (incluyendo columnas nuevas)
+    _ensure_rows(
+        ws,
+        start_row=7,
+        n_rows_needed=max(10, next_row - 6 + len(employees)),
+        base_style_row=7
+    )
 
     merge_mode = str(cfg.get("merge_mode", "sum")).strip().lower()
 
@@ -1111,55 +1230,65 @@ def upsert_week_employees(ws, df_week: pd.DataFrame, cfg: dict):
         # A..D
         ws.cell(row, 1).value = empresa
         ws.cell(row, 2).value = sector
-        ws.cell(row, 3).value = dni_display   # <-- SIEMPRE el ID del master si existe
+        ws.cell(row, 3).value = dni_display
         ws.cell(row, 4).value = nombre
 
-        # Si es fila nueva, inicializamos horas E..L en 0 (con decimales)
+        # Inicializar horas en 0 si es nuevo (Dom..Sab + todos los feriados)
         if is_new:
-            for c in range(5, 13):
+            for c in range(5, 12):  # Dom..Sab
                 ws.cell(row, c).value = 0
-                ws.cell(row, c).number_format = "0.00"
+                ws.cell(row, c).number_format = "0"
+                ws.cell(row, c).alignment = Alignment(horizontal="center", vertical="center")
+            for c in holiday_cols:  # feriados
+                ws.cell(row, c).value = 0
+                ws.cell(row, c).number_format = "0"
                 ws.cell(row, c).alignment = Alignment(horizontal="center", vertical="center")
 
-        # Horas extra por fecha (E..L)
-
+        # Horas extra por fecha
         emp_he_by_date = he_map.get(key_internal, {})
         for dte, he in emp_he_by_date.items():
-            he = float(he)
+            he = int(he)
             if he <= 0:
                 continue
-            col = _col_for_date(dte, cfg)
-            cur = num_or_zero(ws.cell(row, col).value)
+
+            col = _col_for_date(ws, dte, cfg)
+            cur = int(num_or_zero(ws.cell(row, col).value))
 
             if merge_mode == "replace":
                 new_val = he
             else:
                 new_val = cur + he
 
-            new_val = round(new_val, 2)
-            ws.cell(row, col).value = new_val
-            ws.cell(row, col).number_format = "0.00"
+            ws.cell(row, col).value = int(new_val)
+            ws.cell(row, col).number_format = "0"
             ws.cell(row, col).alignment = Alignment(horizontal="center", vertical="center")
 
-        force_integer_hours_format(ws, row, 5, 12)
+        # dejar horas como enteros y formateadas sin coma
+        force_integer_hours_format(ws, row, 5, last_hol)
 
-        # Asegurar fórmulas en la fila
+        # Asegurar fórmulas (si tu plantilla tiene), pero NO tocar los montos que escribimos nosotros
         _ensure_row_formulas_from_base(
             ws,
             target_row=row,
             base_row=7,
-            max_col=max(ws.max_column, 30),
-            skip_cols={13, 14, 15}  # NO tocar M,N,O porque ahora son montos calculados
+            max_col=max(ws.max_column, col_redondeo, 30),
+            skip_cols={col_amt_wd, col_amt_sat, col_amt_domfer, col_subtotal, col_redondeo}
         )
 
-        # --- Luego de cargar horas E..L, calculamos montos M..O ---
-        amt_weekday, amt_sat, amt_domfer = compute_amounts_for_row(ws, row, rate_lav, rate_sab, rate_domfer)
+        # Montos (usa domingo + suma de todos los feriados)
+        amt_weekday, amt_sat, amt_domfer = compute_amounts_for_row(
+            ws, row, rate_lav, rate_sab, rate_domfer, holiday_cols
+        )
+        subtotal = int(amt_weekday + amt_sat + amt_domfer)
+        redondeo = subtotal  # si querés otra regla de redondeo, la cambiamos acá
 
-        ws.cell(row, 13).value = amt_weekday   # M: $ L a V
-        ws.cell(row, 14).value = amt_sat       # N: $ Sábado
-        ws.cell(row, 15).value = amt_domfer    # O: $ Dom y Fer
+        ws.cell(row, col_amt_wd).value = int(amt_weekday)
+        ws.cell(row, col_amt_sat).value = int(amt_sat)
+        ws.cell(row, col_amt_domfer).value = int(amt_domfer)
+        ws.cell(row, col_subtotal).value = int(subtotal)
+        ws.cell(row, col_redondeo).value = int(redondeo)
 
-        for c in (13, 14, 15):
+        for c in (col_amt_wd, col_amt_sat, col_amt_domfer, col_subtotal, col_redondeo):
             ws.cell(row, c).number_format = '"$"#,##0'
             ws.cell(row, c).alignment = Alignment(horizontal="center", vertical="center")
 
