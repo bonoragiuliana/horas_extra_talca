@@ -1,3 +1,4 @@
+# ui_app.py
 import os
 import calendar
 import traceback
@@ -15,6 +16,9 @@ from overtime_calc import compute_overtime_from_daily
 from excel_writer import update_or_build_output_workbook
 from utils_app import normalize_text, guess_col, parse_date, clean_id, id_key_from_any
 
+# ✅ IMPORT CORRECTO: en tu rrhh_print.py la función que existe es build_rrhh_print_workbook
+from rrhh_print import build_rrhh_print_workbook
+
 
 def run_app():
     cfg = load_config()
@@ -30,8 +34,8 @@ def run_app():
     THEME = "minty"
     root = tb.Window(themename=THEME)
     root.title("Liquidación de Horas Extra · TALCA")
-    root.geometry("1120x700")
-    root.minsize(1040, 660)
+    root.geometry("1120x720")
+    root.minsize(1040, 680)
 
     FONT_TITLE = ("Segoe UI", 20, "bold")
     FONT_SUB = ("Segoe UI", 10)
@@ -41,6 +45,11 @@ def run_app():
     var_report = tk.StringVar(master=root, value="")
     var_emp = tk.StringVar(master=root, value=cfg.get("employees_excel_path", ""))
     var_tpl = tk.StringVar(master=root, value=cfg.get("template_excel_path", ""))
+
+    # TAB impresión
+    var_oeste = tk.StringVar(master=root, value="")
+    var_consultora = tk.StringVar(master=root, value="")
+    var_tpl_print = tk.StringVar(master=root, value=cfg.get("print_template_excel_path", ""))
 
     var_use_holidays = tk.BooleanVar(master=root, value=False)
     var_auto_holidays = tk.BooleanVar(master=root, value=bool(cfg.get("auto_holidays_enabled", True)))
@@ -54,6 +63,7 @@ def run_app():
     selected_holidays_auto = set()
 
     btn_generate = None
+    btn_print = None
 
     def set_status(msg: str):
         status_var.set(msg)
@@ -63,8 +73,11 @@ def run_app():
             pass
 
     def month_name_es(m):
-        names = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
-        return names[m-1]
+        names = [
+            "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+            "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+        ]
+        return names[m - 1]
 
     def get_report_date_range_and_emps(report_path: str):
         try:
@@ -136,17 +149,29 @@ def run_app():
             emp and os.path.exists(emp) and
             tpl and os.path.exists(tpl)
         )
+        if btn_generate is not None:
+            btn_generate.configure(state=("normal" if ok else "disabled"))
 
-        if btn_generate is None:
-            return
+    def update_print_state():
+        p1 = var_oeste.get().strip()
+        p2 = var_consultora.get().strip()
+        tp = var_tpl_print.get().strip()
 
-        btn_generate.configure(state=("normal" if ok else "disabled"))
+        ok = bool(
+            p1 and os.path.exists(p1) and
+            p2 and os.path.exists(p2) and
+            tp and os.path.exists(tp)
+        )
+        if btn_print is not None:
+            btn_print.configure(state=("normal" if ok else "disabled"))
 
     def update_summary():
         rp = var_report.get().strip()
         if rp and os.path.exists(rp):
             start, end, emps = get_report_date_range_and_emps(rp)
-            summary_range_var.set(f"{start.strftime('%d/%m/%Y')} → {end.strftime('%d/%m/%Y')}" if start and end else "—")
+            summary_range_var.set(
+                f"{start.strftime('%d/%m/%Y')} → {end.strftime('%d/%m/%Y')}" if start and end else "—"
+            )
             summary_emps_var.set(str(emps) if emps is not None else "—")
         else:
             summary_range_var.set("—")
@@ -156,6 +181,7 @@ def run_app():
         summary_holidays_var.set(", ".join(d.strftime("%d/%m") for d in all_h) if all_h else "—")
 
         update_generate_state()
+        update_print_state()
 
     # defaults locales
     local_emp = os.path.join(os.getcwd(), EMP_MASTER_DEFAULT_NAME)
@@ -168,6 +194,19 @@ def run_app():
         var_tpl.set(local_tpl)
         cfg["template_excel_path"] = local_tpl
 
+    # plantilla impresión: probamos nombres típicos en la carpeta del proyecto
+    if not var_tpl_print.get().strip():
+        candidates = [
+            os.path.join(os.getcwd(), "formatosugerido - impresion.xlsx"),
+            os.path.join(os.getcwd(), "formatosugerido_impresion.xlsx"),
+            os.path.join(os.getcwd(), "plantilla_impresion.xlsx"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                var_tpl_print.set(c)
+                cfg["print_template_excel_path"] = c
+                break
+
     # ==========================================================
     # LAYOUT
     # ==========================================================
@@ -178,7 +217,12 @@ def run_app():
     left_h.pack(side="left", fill="x", expand=True)
 
     tb.Label(left_h, text="Liquidación de Horas Extra", font=FONT_TITLE).pack(anchor="w")
-    tb.Label(left_h, text="Generación automática desde VeoTime → Excel RRHH", font=FONT_SUB, foreground="#666").pack(anchor="w", pady=(4, 0))
+    tb.Label(
+        left_h,
+        text="Generación automática desde VeoTime → Excel RRHH",
+        font=FONT_SUB,
+        foreground="#666"
+    ).pack(anchor="w", pady=(4, 0))
 
     right_h = tb.Frame(header)
     right_h.pack(side="right")
@@ -220,9 +264,11 @@ def run_app():
 
     tab_files = tb.Frame(nb, padding=16)
     tab_holidays = tb.Frame(nb, padding=16)
+    tab_print = tb.Frame(nb, padding=16)
 
     nb.add(tab_files, text="  1 · Archivos  ")
     nb.add(tab_holidays, text="  2 · Feriados  ")
+    nb.add(tab_print, text="  3 · Impresión  ")
 
     summary = tb.Labelframe(right, text="RESUMEN", padding=16, bootstyle="secondary")
     summary.pack(fill="x")
@@ -257,7 +303,7 @@ def run_app():
         top.pack(fill="x")
         tb.Label(top, text=title, font=FONT_B).pack(side="left")
         if hint:
-            tb.Label(top, text=hint, font=FONT_SUB, foreground="#666").pack(side="left", padx=(10, 0))
+            tb.Label(top, text=hint, font=("Segoe UI", 9), foreground="#666").pack(side="left", padx=(10, 0))
 
         row = tb.Frame(box)
         row.pack(fill="x", pady=(6, 0))
@@ -572,12 +618,128 @@ def run_app():
         render_calendar()
 
     # ==========================================================
+    # TAB 3: IMPRESIÓN
+    # ==========================================================
+    tb.Label(tab_print, text="Generar planilla de impresión (RRHH)", font=FONT_H2).pack(anchor="w")
+    tb.Label(
+        tab_print,
+        text="Unifica OESTE + CONSULTORA en un solo Excel usando la plantilla de impresión.",
+        foreground="#666"
+    ).pack(anchor="w", pady=(6, 0))
+
+    def pick_oeste():
+        p = filedialog.askopenfilename(
+            title="Seleccioná la planilla generada de OESTE",
+            filetypes=[("Excel", "*.xlsx *.xls")]
+        )
+        if p:
+            var_oeste.set(p)
+            update_print_state()
+
+    def pick_consultora():
+        p = filedialog.askopenfilename(
+            title="Seleccioná la planilla generada de CONSULTORA",
+            filetypes=[("Excel", "*.xlsx *.xls")]
+        )
+        if p:
+            var_consultora.set(p)
+            update_print_state()
+
+    def pick_tpl_print():
+        p = filedialog.askopenfilename(
+            title="Seleccioná la plantilla de impresión",
+            filetypes=[("Excel", "*.xlsx")]
+        )
+        if p:
+            var_tpl_print.set(p)
+            cfg["print_template_excel_path"] = p
+            save_config(cfg)
+            update_print_state()
+
+    entry_file(tab_print, "Planilla OESTE (generada)", var_oeste, pick_oeste, hint="Obligatorio")
+    entry_file(tab_print, "Planilla CONSULTORA (generada)", var_consultora, pick_consultora, hint="Obligatorio")
+    entry_file(tab_print, "Plantilla impresión (.xlsx)", var_tpl_print, pick_tpl_print, hint="Obligatorio")
+
+    print_actions = tb.Frame(tab_print)
+    print_actions.pack(fill="x", pady=(16, 0))
+
+    def generate_rrhh_print_from_tab():
+        path_oeste = var_oeste.get().strip()
+        path_consultora = var_consultora.get().strip()
+        tpl_print = var_tpl_print.get().strip()
+
+        if not (path_oeste and os.path.exists(path_oeste)):
+            messagebox.showerror("Falta archivo", "Seleccioná la planilla de OESTE.")
+            return
+        if not (path_consultora and os.path.exists(path_consultora)):
+            messagebox.showerror("Falta archivo", "Seleccioná la planilla de CONSULTORA.")
+            return
+        if not (tpl_print and os.path.exists(tpl_print)):
+            messagebox.showerror("Falta plantilla", "Seleccioná la plantilla de impresión.")
+            return
+
+        # ✅ SIN CAMPO "Guardar como (salida)" → sólo diálogo Guardar
+        out_path = filedialog.asksaveasfilename(
+            title="Guardar planilla de impresión",
+            defaultextension=".xlsx",
+            initialfile="Impresion_RRHH.xlsx",
+            filetypes=[("Excel", "*.xlsx")]
+        )
+        if not out_path:
+            return
+
+        btn_print.configure(state="disabled")
+        pb.start(12)
+
+        try:
+            set_status("Generando impresión RRHH… (Oeste + Consultora → una sola planilla)")
+            build_rrhh_print_workbook(
+                path_oeste=path_oeste,
+                path_consultora=path_consultora,
+                template_print_path=tpl_print,
+                out_path=out_path
+            )
+            set_status("Listo ✅ Impresión RRHH generada.")
+            messagebox.showinfo("Listo ✅", f"Se generó el archivo de impresión:\n{out_path}")
+
+        except PermissionError:
+            set_status("Error ❌ El archivo está abierto.")
+            messagebox.showerror(
+                "Archivo en uso",
+                "Cerrá el Excel (está abierto) y volvé a intentar.\n"
+                "Windows no deja guardar si el archivo está en uso."
+            )
+        except Exception as e:
+            tbtxt = traceback.format_exc()
+            with open("debug_error_rrhh_print.txt", "w", encoding="utf-8") as f:
+                f.write(tbtxt)
+            set_status("Error ❌ Revisá debug_error_rrhh_print.txt")
+            messagebox.showerror("Error", f"{e}\n\nSe guardó el detalle en debug_error_rrhh_print.txt")
+        finally:
+            pb.stop()
+            update_print_state()
+
+    btn_print = tb.Button(
+        print_actions,
+        text="Generar impresión",
+        command=generate_rrhh_print_from_tab,
+        bootstyle="info",
+        width=22
+    )
+    btn_print.pack(side="right")
+    update_print_state()
+
+    # ==========================================================
     # FOOTER: GENERATE
     # ==========================================================
     footer = tb.Frame(root, padding=(20, 12))
     footer.pack(fill="x")
 
-    tb.Label(footer, text="Podés guardar un archivo nuevo o elegir uno existente para agregar empleados.", foreground="#666").pack(side="left")
+    tb.Label(
+        footer,
+        text="Podés guardar un archivo nuevo o elegir uno existente para agregar empleados.",
+        foreground="#666"
+    ).pack(side="left")
 
     def generate():
         rp = var_report.get().strip()
@@ -651,6 +813,7 @@ def run_app():
 
     btn_generate = tb.Button(footer, text="Generar / Actualizar", command=generate, bootstyle="success", width=22)
     btn_generate.pack(side="right")
+    update_generate_state()
 
     # ==========================================================
     # Bindings + init
