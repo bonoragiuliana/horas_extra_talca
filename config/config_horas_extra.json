@@ -1,0 +1,16 @@
+{
+  "company_name": "TALCA",
+  "default_jornada_weekday": 8,
+  "employees_excel_path": "",
+  "template_excel_path": "",
+  "holidays": [],
+  "auto_holidays_enabled": true,
+  "auto_holidays_country": "AR",
+  "auto_holidays_subdiv": "M",
+  "auto_holidays_observed": true,
+  "debug": false,
+  "merge_mode": "sum",
+  "saturday_standard_hours": 0,
+  "sunday_standard_hours": 0,
+  "holiday_standard_hours": 0
+}
